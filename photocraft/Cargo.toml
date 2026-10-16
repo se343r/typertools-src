@@ -1,0 +1,25 @@
+[package]
+name = "photocraft-plugin-typertools"
+description = "TyperTools for PhotoCraft: manga and comic lettering (WebAssembly panel plug-in, ABI v2)"
+version = "1.4.9"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Not a member of any workspace, and deliberately so: the crate builds for wasm32-unknown-unknown
+# only, and nothing in it may reach a host crate. PhotoCraft's own copy of it lived at
+# examples/plugins/typertools before it moved here.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
