@@ -771,6 +771,12 @@ pub fn starter(font: Option<&str>) -> Library {
         s.prefix_color = PREFIX_COLORS[i % PREFIX_COLORS.len()].to_string();
         if let Some(f) = font {
             props::set_font(&mut s.text_props, f, face, None);
+        } else {
+            // A starter style is laid down before the host has listed its fonts, so it names no
+            // family yet — but the face is this style type's own (Whisper is italic, Shout bold) and
+            // must survive until `starter_font` gives it a family. Without this, the fallback face
+            // below applied to every style and the five starter styles lettered alike.
+            props::set_char(&mut s.text_props, "fontStyleName", json!(face));
         }
         props::set_char(&mut s.text_props, "size", json!(size));
         props::set_char(&mut s.text_props, "impliedFontSize", json!(size));
@@ -1230,6 +1236,10 @@ mod tests {
         // With no font to offer, a starter style keeps TypeR's own default rather than nothing.
         let lib = starter(None);
         assert!(lib.styles.iter().all(|s| props::family(&s.text_props) == props::DEFAULT_FONT));
+        // The face is each style type's own even before a family is known: Whisper is italic and
+        // Shout is bold in TypeR's library, and the placeholder family must not flatten them.
+        let faces: Vec<String> = lib.styles.iter().map(|s| props::font_style(&s.text_props)).collect();
+        assert_eq!(faces, ["Regular", "Italic", "Bold", "Italic", "Bold"]);
         // The whole thing survives a round trip through the library format.
         let back = Library::from_json(&lib.to_json());
         assert_eq!(back, lib);

@@ -210,30 +210,85 @@ fn unit_suffix(p: &Panel) -> &'static str {
     }
 }
 
+/// Cuts text to at most `max` UTF-8 bytes, on a character boundary. Widget option values and ids
+/// are bounded in bytes, and a library is JSON that can name any string; cutting mid-character
+/// would make the value invalid.
+fn cut_bytes(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// One dropdown option, with its value and label cut to what a widget may carry.
+fn option(name: &str) -> (String, String) {
+    (cut_bytes(name, 256), cut_to(name, 256))
+}
+
 /// The family list for the dropdown: what the host has, then whatever the style names. A style whose
 /// font is not installed here is offered anyway — a library travels between machines — and says so,
 /// because "the font this style was written in is not on this machine" is something the letterer has
 /// to be told, not something to hide behind a dropdown that silently shows a different font.
-fn families(p: &Panel) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = p.fonts.families.iter().take(200).map(|f| (f.clone(), f.clone())).collect();
-    let current = p.edit.as_ref().map(|e| props::family(&e.props)).unwrap_or_default();
-    if !current.is_empty() && !out.iter().any(|(v, _)| *v == current) {
-        out.insert(0, (current.clone(), format!("{current} (not installed)")));
+///
+/// Returns the value the dropdown must show as well as its options: the host requires the value to be
+/// one of them, so an over-long stored name is cut the same way as the option it is matched against.
+fn families(p: &Panel) -> (String, Vec<(String, String)>) {
+    let stored = p.edit.as_ref().map(|e| props::family(&e.props)).unwrap_or_default();
+    let current = cut_bytes(&stored, 256);
+    let mut out: Vec<(String, String)> = Vec::new();
+    for f in p.fonts.families.iter().take(200) {
+        let o = option(f);
+        if !out.iter().any(|(v, _)| *v == o.0) {
+            out.push(o);
+        }
     }
-    out
+    if !current.is_empty() && !out.iter().any(|(v, _)| *v == current) {
+        out.insert(0, (current.clone(), cut_to(&format!("{stored} (not installed)"), 256)));
+    }
+    (current, out)
 }
 
 /// The face list for the family that is selected. Faces are only known for the family the host was
 /// last asked about (`type.fonts {"family": …}`), and the current face is always offered.
-fn faces(p: &Panel) -> Vec<(String, String)> {
-    let current = p.edit.as_ref().map(|e| props::font_style(&e.props)).unwrap_or_default();
+fn faces(p: &Panel) -> (String, Vec<(String, String)>) {
+    let stored = p.edit.as_ref().map(|e| props::font_style(&e.props)).unwrap_or_default();
+    let current = cut_bytes(&stored, 256);
     let family = p.edit.as_ref().map(|e| props::family(&e.props)).unwrap_or_default();
-    let mut out: Vec<(String, String)> =
-        if p.fonts.face_family == family { p.fonts.faces.iter().map(|f| (f.clone(), f.clone())).collect() } else { Vec::new() };
-    if !current.is_empty() && !out.iter().any(|(v, _)| *v == current) {
-        out.insert(0, (current.clone(), current));
+    let mut out: Vec<(String, String)> = Vec::new();
+    if p.fonts.face_family == family {
+        for f in p.fonts.faces.iter().take(200) {
+            let o = option(f);
+            if !out.iter().any(|(v, _)| *v == o.0) {
+                out.push(o);
+            }
+        }
     }
-    out
+    if !current.is_empty() && !out.iter().any(|(v, _)| *v == current) {
+        out.insert(0, (current.clone(), cut_to(&stored, 256)));
+    }
+    (current, out)
+}
+
+/// The font a style letters in, as one line: family, face and size in the style's own unit. The
+/// library shows it under every style and the editor at its top, so the typeface behind each style
+/// type — Dialogue, Whisper, Shout… — is visible without opening each style in turn. A library that
+/// travelled from another machine can name anything, so both names are cut to a label's length.
+pub fn font_summary(props: &Value) -> String {
+    let family = cut_to(&props::family(props), 120);
+    let face = cut_to(&props::font_style(props), 40);
+    let size = props::char(props, "size").and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(props::DEFAULT_SIZE);
+    let unit = match props::type_unit(props) {
+        "mmUnit" => " mm",
+        "inchesUnit" => " in",
+        "picasUnit" => " pc",
+        "pointsUnit" => " pt",
+        _ => " px",
+    };
+    format!("{family} {face} · {size}{unit}")
 }
 
 // --- the panel ---------------------------------------------------------------------------------
@@ -486,6 +541,10 @@ fn styles(p: &Panel) -> Vec<Value> {
         line.push(button(&format!("s{i}_apply"), "Apply", false, !busy(p)));
         line.push(button(&format!("s{i}_edit"), "Edit", false, !busy(p)));
         out.push(row(line));
+        // Under the row rather than in it: the name row is already sharing its width with the size
+        // step and the two buttons, and a font pasted after the name would be clipped off the right
+        // edge of a 250 px panel.
+        out.push(muted(format!("Font: {}", font_summary(&s.text_props))));
     }
     if p.library.styles.len() > MAX_ROWS {
         out.push(warning(format!(
@@ -510,11 +569,16 @@ fn style_editor(p: &Panel) -> Vec<Value> {
         return vec![muted("No style is open. Pick one from the Styles page, or make a new one."), row(vec![button("newStyle", "New style", false, true)])];
     };
     let (name, prefixes, color, folder, is_new) = (e.name.clone(), e.prefixes.clone(), e.color.clone(), e.folder.clone(), e.is_new);
-    let mut font_row = vec![muted("Font"), choice("ed_font", &props::family(&e.props), families(p))];
+    // "Font" is the one control a letterer goes looking for by name, so it is a label rather than
+    // dimmed like the rest, and the row says how many families the host listed — an empty-looking
+    // dropdown with no explanation reads as a broken panel.
+    let (font_value, font_options) = families(p);
+    let (face_value, face_options) = faces(p);
+    let mut font_row = vec![label("Font"), choice("ed_font", &font_value, font_options)];
     if p.fonts.is_empty() {
-        // The engine finds a face by itself, so a host with no enumerable fonts still letters — but
-        // an empty dropdown with no explanation reads as a broken panel.
         font_row.push(muted("(this host has listed no fonts)"));
+    } else {
+        font_row.push(muted(format!("{} from this host", p.fonts.families.len())));
     }
     let mut out = vec![
         row(vec![label("Name"), text("ed_name", &name, "Dialogue", false, LABEL_MAX)]),
@@ -523,7 +587,7 @@ fn style_editor(p: &Panel) -> Vec<Value> {
         row(vec![muted("Folder"), choice("ed_folder", folder.as_deref().unwrap_or("-"), folder_options(p))]),
         separator(),
         row(font_row),
-        row(vec![muted("Face"), choice("ed_face", &props::font_style(&e.props), faces(p))]),
+        row(vec![muted("Face"), choice("ed_face", &face_value, face_options)]),
         row(vec![muted(format!("Size{}", unit_suffix(p))), number("ed_size", length(p, "size", true, 14.0), 0.1, 1296.0, 0.5, false)]),
         row(vec![
             toggle("ed_autoLeading", b(c(p, "autoLeading").as_ref()), "Auto leading"),
@@ -647,7 +711,10 @@ fn style_editor(p: &Panel) -> Vec<Value> {
             unsupported.join(", ")
         )));
     }
-    out.insert(0, muted(format!("Editing “{name}”{}", if is_new { " (new)" } else { "" })));
+    // The name and the font the style letters in, together at the top: the answer to "which font is
+    // Dialogue in?" should not require scrolling to the font row and reading a dropdown.
+    out.insert(0, label(format!("Editing “{name}”{}", if is_new { " (new)" } else { "" })));
+    out.insert(1, muted(format!("Font: {}", font_summary(&e.props))));
     out
 }
 
@@ -963,6 +1030,65 @@ mod tests {
                 p.run = None;
             }
             assert!(!what.is_empty());
+        }
+    }
+
+    #[test]
+    fn every_style_row_says_which_font_it_letters_in() {
+        // TypeR's library is a row per style type — Dialogue, Whisper, Shout… — and the typeface
+        // behind each one used to be visible only by opening the style and reading a dropdown.
+        let mut p = Panel::new();
+        p.library = starter(Some("Inter"));
+        for (id, family) in [("s1", "Comic Sans MS"), ("s2", "Inter"), ("s3", "Impact")] {
+            if let Some(s) = p.library.styles.iter_mut().find(|s| s.id == id) {
+                let face = props::font_style(&s.text_props);
+                props::set_font(&mut s.text_props, family, &face, None);
+            }
+        }
+        p.page = Page::Styles;
+        let view = render(&p);
+        check(&view);
+        let dumped = view.to_string();
+        assert!(dumped.contains("Font: Comic Sans MS Regular · 14 pt"), "Dialogue's font is on its row: {dumped}");
+        assert!(dumped.contains("Font: Inter Italic · 10 pt"), "Whisper's font is on its row: {dumped}");
+        assert!(dumped.contains("Font: Impact Bold · 22 pt"), "Shout's font is on its row: {dumped}");
+    }
+
+    #[test]
+    fn the_editor_names_the_font_at_its_top_and_says_what_the_host_listed() {
+        let mut p = Panel::new();
+        p.library = starter(Some("Comic Sans MS"));
+        p.start_edit("s1", false);
+        p.page = Page::Style;
+        p.fonts.families = vec!["Comic Sans MS".into(), "Inter".into()];
+        let view = render(&p);
+        check(&view);
+        let dumped = view.to_string();
+        assert!(dumped.contains("Editing “Dialogue”"), "{dumped}");
+        assert!(dumped.contains("Font: Comic Sans MS Regular · 14 pt"), "the font is stated above the controls: {dumped}");
+        assert!(dumped.contains("2 from this host"), "and where the families came from: {dumped}");
+        assert!(!dumped.contains("this host has listed no fonts"), "{dumped}");
+
+        // A host that listed nothing says so, rather than leaving an unexplained dropdown.
+        p.fonts.families.clear();
+        let empty = render(&p).to_string();
+        assert!(empty.contains("this host has listed no fonts"), "{empty}");
+        assert!(!empty.contains("from this host"), "{empty}");
+    }
+
+    #[test]
+    fn a_style_naming_an_absurd_font_still_draws() {
+        // A library is JSON the letterer can edit in Help: a family or face name can be any length,
+        // and the host refuses the whole tree when one option is over 256 bytes. Cut, don't stop.
+        let mut p = Panel::new();
+        p.library = starter(None);
+        if let Some(s) = p.library.styles.first_mut() {
+            props::set_font(&mut s.text_props, &"F".repeat(500), &format!("{}é", "R".repeat(400)), None);
+        }
+        p.start_edit("s1", false);
+        for page in [Page::Styles, Page::Style] {
+            p.page = page;
+            check(&render(&p));
         }
     }
 
