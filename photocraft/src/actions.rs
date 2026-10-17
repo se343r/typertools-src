@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn resize_grows_the_box_with_the_type_and_keeps_the_line_where_it_was() {
         let mut r = Run::begin(Kind::Resize, "tt4".into(), vec![4]);
-        r.delta = geom::size_step_pt(DPI); // one document pixel: 0.24 pt at 300 dpi
+        r.delta = geom::size_step_pt(DPI, "pixelsUnit"); // one document pixel: 0.24 pt at 300 dpi
 
         let before = info("I'll be home by six.", [300.0, 400.0, 500.0, 430.0], 14.0, Some([300.0, 400.0, 200.0, 30.0]));
         assert!(matches!(r.step(DPI, None), Step::Call { command: "type.info", .. }));
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn shrinking_point_text_leaves_its_shape_alone() {
         let mut r = Run::begin(Kind::Resize, "tt5".into(), vec![4]);
-        r.delta = -geom::size_step_pt(DPI);
+        r.delta = -geom::size_step_pt(DPI, "pixelsUnit");
         let before = info("shout", [0.0, 0.0, 100.0, 40.0], 20.0, None);
         assert!(matches!(r.step(DPI, None), Step::Call { command: "type.info", .. }));
         let (command, params) = call(r.step(DPI, Some(&before)));
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn a_size_that_cannot_move_any_further_says_so() {
         let mut r = Run::begin(Kind::Resize, "tt6".into(), vec![4]);
-        r.delta = geom::size_step_pt(DPI);
+        r.delta = geom::size_step_pt(DPI, "pixelsUnit");
         assert!(matches!(r.step(DPI, None), Step::Call { command: "type.info", .. }));
         match r.step(DPI, Some(&info("x", [0.0, 0.0, 1.0, 1.0], geom::MAX_SIZE_PT, None))) {
             Step::Failed(why) => assert!(why.contains("already at 1296.0 pt"), "{why}"),

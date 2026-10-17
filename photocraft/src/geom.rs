@@ -2,9 +2,9 @@
 //!
 //! Every number here is a behaviour of **TyperTools 1.4.9** (a Photoshop CEP panel, MIT, © 2017
 //! Swirt) read off its published source: how it turns a marquee drawn around a balloon into a text
-//! box, how it nudges the type size, and how it keeps a block of type where it was. The port is
-//! clean-room — the behaviour and the constants are observations, no code is copied — and each
-//! constant has a test, because this is the part a letterer notices drifting.
+//! box, how it nudges the type size, and how it keeps a block of type where it was. This is a port,
+//! so the constants are taken from that source rather than guessed, and each one has a test, because
+//! this is the part a letterer notices drifting.
 //!
 //! One model difference is worth stating up front. Photoshop stores a layer's type size in the
 //! layer's own ruler unit, and TyperTools' default is pixels, so a size of `14` there is 14 device
@@ -16,28 +16,35 @@
 /// How much the marquee is pulled in before it is used, in document pixels.
 ///
 /// TyperTools contracts the selection by 10 px and then measures it, so the balloon's outline (and
-/// the marquee's own soft edge) does not decide the text box.
+/// the marquee's own soft edge) does not decide the text box. `host.js:208`, in `_checkSelection`.
 pub const SELECTION_CONTRACT_PX: f64 = 10.0;
 
 /// A selection smaller than this is not a balloon, in square pixels.
+///
+/// `host.js:210`: `selection.width * selection.height < 200` is TyperTools' `smallSelection`.
 pub const MIN_SELECTION_AREA: f64 = 200.0;
 
-/// A new text box takes this much of the (contracted) selection's width.
+/// A new text box takes this much of the (contracted) selection's width. `host.js:356` and `:390`.
 pub const BOX_WIDTH_FACTOR: f64 = 0.9;
 
 /// …and this many times its height: the box is deliberately far too tall to begin with, so the text
-/// lays out on one line, and is shrunk around the result afterwards.
+/// lays out on one line, and is shrunk around the result afterwards. `host.js:357` and `:391`.
 pub const BOX_HEIGHT_FACTOR: f64 = 15.0;
 
 /// Growing the type grows the box with it: the bottom by this factor, the right by this one.
+/// `host.js:456-457`, in `_changeActiveLayerTextSize`, and only while the size is going up.
 pub const BOX_GROW_BOTTOM: f64 = 1.12;
 pub const BOX_GROW_RIGHT: f64 = 1.06;
 
-/// The size buttons move the type by one document pixel, expressed in points at the document's
-/// resolution.
-pub const SIZE_STEP_PX: f64 = 1.0;
+/// The size buttons move the type by one of **the style's own unit** — `_changeActiveLayerTextSize`
+/// adds `changeActiveLayerTextSizeVal` (1, from both size buttons, `host.js:599`) to the size the
+/// layer carries, so a library written in pixels steps a pixel and one written in millimetres steps a
+/// millimetre. The `±0.2 mm / 1 px / 0.5 pt` table at `host.js:471` is `_changeSize_alt`, which
+/// nothing calls.
+pub const SIZE_STEP: f64 = 1.0;
 
-/// Extra room left under the last line when a box is refitted around its text, in document pixels.
+/// Extra room left under the last line when a box is refitted around its text, in document pixels:
+/// `_setTextBoxSize(width, bounds.height + textSize + 2)`, `host.js:365` and `:399`.
 pub const BOX_PAD_PX: f64 = 2.0;
 
 /// The size used when neither a style nor the layer says (points, at 72 dpi).
@@ -163,9 +170,15 @@ pub fn pt_to_px(pt: f64, dpi: f64) -> f64 {
     pt * dpi / 72.0
 }
 
-/// One press of a size button: one document pixel, in points.
-pub fn size_step_pt(dpi: f64) -> f64 {
-    px_to_pt(SIZE_STEP_PX, dpi)
+/// One press of a size button, in points: one unit of the style's own `typeUnit`, converted at the
+/// document's resolution.
+///
+/// TyperTools steps the *layer's* size in the layer's ruler unit, which Photoshop keeps per layer.
+/// PhotoCraft's type is sized in points and has no per-layer ruler, so what says how big a step is
+/// is the unit the library writes its styles in — pixels by default, which is TyperTools' own default
+/// and steps one document pixel, exactly as it does there.
+pub fn size_step_pt(dpi: f64, unit: &str) -> f64 {
+    length_to_pt(SIZE_STEP, Some(unit), dpi)
 }
 
 /// A length in one of Photoshop's `typeUnit`s, in points. PhotoCraft's type is sized in points, so
@@ -238,12 +251,20 @@ mod tests {
     }
 
     #[test]
-    fn the_size_step_is_one_document_pixel() {
-        // 72 dpi: a pixel is a point. 300 dpi: it is a quarter of one.
-        assert!((size_step_pt(72.0) - 1.0).abs() < 1e-9);
-        assert!((size_step_pt(300.0) - 0.24).abs() < 1e-9);
-        // A nonsense resolution must not produce a nonsense size.
-        assert_eq!(size_step_pt(0.0), SIZE_STEP_PX);
+    fn the_size_step_is_one_of_the_styles_own_units() {
+        // TyperTools' default unit, pixels, at 72 dpi: a pixel is a point; at 300 dpi it is a quarter
+        // of one.
+        assert!((size_step_pt(72.0, "pixelsUnit") - 1.0).abs() < 1e-9);
+        assert!((size_step_pt(300.0, "pixelsUnit") - 0.24).abs() < 1e-9);
+        // Any other unit steps one of itself, whatever the resolution: a point is a point, an inch is
+        // 72 of them, and a millimetre is 2.8346.
+        assert!((size_step_pt(300.0, "pointsUnit") - 1.0).abs() < 1e-9);
+        assert!((size_step_pt(300.0, "inchesUnit") - 72.0).abs() < 1e-9);
+        assert!((size_step_pt(300.0, "picasUnit") - 12.0).abs() < 1e-9);
+        assert!((size_step_pt(300.0, "mmUnit") - 72.0 / 25.4).abs() < 1e-9);
+        // A unit this port does not know, and no document: points, one step, no nonsense.
+        assert!((size_step_pt(300.0, "furlongUnit") - 1.0).abs() < 1e-9);
+        assert!((size_step_pt(0.0, "pixelsUnit") - 1.0).abs() < 1e-9);
     }
 
     #[test]

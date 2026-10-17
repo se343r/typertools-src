@@ -20,14 +20,16 @@ use serde_json::{Map, Value, json};
 
 use crate::props;
 
-/// TyperTools' default prefix colour (`config.defaultPrefixColor`).
+/// TyperTools' default prefix colour: `app_src/config.js:8`, `defaultPrefixColor`.
 pub const DEFAULT_PREFIX_COLOR: &str = "#FFF3B0";
 
-/// The prefix colours TyperTools offers as presets, in its order.
+/// The prefix colours TyperTools offers as presets, in its order: the `presetColors` list at the
+/// call site in `app_src/components/modal/editStyle.jsx:198`.
 pub const PREFIX_COLORS: [&str; 8] = ["#FFA6A4", "#FDD4BB", "#FFF3B0", "#CDFDD3", "#BEDADC", "#C2F2FF", "#C3C9FF", "#F6D5FF"];
 
-/// The version written into an export, so a file says what wrote it. This port is at parity with
-/// TyperTools 1.4.9 and writes that version.
+/// The version written into an export, so a file says what wrote it: `config.appVersion`
+/// (`app_src/config.js:3`), which `settings.jsx:86` writes into the export. This port is at parity
+/// with TyperTools 1.4.9 and writes that version.
 pub const FORMAT_VERSION: &str = "1.4.9";
 
 /// A folder of styles, in the order the letterer put them.

@@ -3,15 +3,17 @@
 A **panel** plug-in for [PhotoCraft](https://github.com/storytold/photocraft) — plug-in ABI v2, the
 native Rust image editor — that ports this repository's
 [TyperTools](https://github.com/Swirt/typertools-src) 1.4.9, the manga and comic lettering workflow
-panel for Adobe Photoshop, to the native app as a clean-room Rust reimplementation.
+panel for Adobe Photoshop, to the native app: its strings, its style-library format, its geometry and
+its layout, driving PhotoCraft's own type engine.
 
 This directory is that port. The original CEP/ExtendScript panel is untouched in this repository's
-root (`app_src/`, `CSXS/`, `locale/`); nothing here is built from it, and nothing here is copied from
-it — see [Licensing](#licensing).
+root (`app_src/`, `CSXS/`, `locale/`) — under TyperTools' MIT licence that source is reused rather
+than re-derived, so the two live together on purpose; see [Licensing](#licensing) for the four
+things that stay out.
 
 It is the port PhotoCraft's panel ABI was designed for, and the largest thing that runs on it: about
 6,500 lines of ordinary safe Rust, no `unsafe`, no imports, no JavaScript, and one `.wasm` module
-(336,828 bytes) that is committed here so it can be installed without a Rust toolchain.
+(337,491 bytes) that is committed here so it can be installed without a Rust toolchain.
 
 ## What it does
 
@@ -54,7 +56,7 @@ nothing in it may reach a host crate.
 ## Install
 
 Needs a PhotoCraft with plug-in ABI v2 (the panel host, `docs/plugins-v2.md` there; it lands with
-[PR #6702](https://github.com/storytold/photocraft/pull/6702)). Then, from the app's control channel
+[PR #6733](https://github.com/storytold/photocraft/pull/6733)). Then, from the app's control channel
 or the CLI:
 
 ```sh
@@ -98,11 +100,26 @@ in the control — is a button instead of the gesture:
 
 ## Licensing
 
-Clean-room. Upstream TyperTools is MIT (© 2017 Swirt, this repository's `LICENSE.md`) and this port
-reimplements its *behaviour*: no source, artwork, locale file or vendored library of it is copied, and
-in particular the GPL `app_src/lib/jam/*` that TyperTools bundles (© Michel MARIANI) and Adobe's
-proprietary `CSInterface.js` are not used at all — there is no ExtendScript here.
+A port, under the licence that makes a port possible. Upstream TyperTools is MIT (© 2017 Swirt, this
+repository's `LICENSE.md`), so its source is **reused** rather than re-derived: the strings, the
+style-library JSON, the geometry constants and the layout are taken from `app_src/` and transliterated
+into Rust, and this port is meant to be read next to the original. ExtendScript and React cannot run
+inside a wasm panel, so the rewrite is forced — but what it says is the original's, not a fresh guess
+at what the original probably did.
+
+Four things stay out, because they are not MIT and reusing them would relicense the port (or ship
+someone else's assets):
+
+| Not carried over | Why |
+|---|---|
+| `app_src/lib/jam/*.jsxinc` | GPL v3+, © 2011–2016 Michel MARIANI |
+| `app_src/lib/CSInterface.js` | Adobe's proprietary CEP library |
+| `app_src/lib/topcoat/*` | Apache-2.0, © 2012 Adobe Systems Inc. — a CSS widget kit, with bundled fonts |
+| `icons/*.png` | Photoshop CEP panel icons |
+
+There is also nothing in this port that uses them: no ExtendScript, no CEP, no CSS, no icons. The
+full provenance is in [`ATTRIBUTION.md`](ATTRIBUTION.md).
 
 The port itself is MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`, the same terms PhotoCraft
-uses). Its interface is English only: TyperTools' own locale strings are MIT and could be reused with
-attribution, but none are — the panel has one language until someone asks for a second.
+uses), and its interface is English only: TyperTools' own locale strings are MIT and may be reused
+with attribution when someone asks for a second language.

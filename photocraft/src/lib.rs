@@ -3,9 +3,13 @@
 //! [TyperTools](https://github.com/Swirt/typertools-src) is a Photoshop CEP panel for letterers: you
 //! paste a script, one line of dialogue per row, tag each line with a style's prefix, and it sets the
 //! line into the page in that style — then lets you align it to a balloon and size the type to fit.
-//! This is a clean-room port of it to PhotoCraft's own type engine, packaged as a real plug-in rather
-//! than a built-in feature. It reimplements TyperTools' behaviour and its library format; it copies
-//! neither its code nor the third-party and Adobe code it vendors (see the row in `ATTRIBUTION.md`).
+//! This is a port of it to PhotoCraft's own type engine, packaged as a real plug-in rather than a
+//! built-in feature. A port, not an independent rewrite: TyperTools is MIT (© 2017 Swirt), so its
+//! source is *reused* — its strings, its style-library JSON, its geometry constants and the shape of
+//! its layout are taken from it and transliterated into Rust, which is why the two can be read side
+//! by side. What cannot come across is the part that is not ours to take: the GPL `lib/jam/*` it
+//! vendors, Adobe's proprietary `CSInterface.js`, the Topcoat widget kit, and its CEP icons. See
+//! `ATTRIBUTION.md`.
 //!
 //! The crate is two halves. `actions`, `doc`, `geom`, `library`, `props`, `script` and `view` are the
 //! plug-in itself — pure functions and a state machine, with no host access of any kind, which is why
@@ -55,7 +59,7 @@ const MANIFEST: &str = r#"{
   "version": "1.4.9",
   "kind": "panel",
   "author": "PhotoCraft contributors",
-  "description": "Manga and comic lettering: paste a script, tag each line with a style's prefix, and set it into the page in that style. A clean-room port of TyperTools 1.4.9.",
+  "description": "Manga and comic lettering: paste a script, tag each line with a style's prefix, and set it into the page in that style. A port of TyperTools 1.4.9.",
   "panel": { "title": "TyperTools", "minWidth": 320 },
   "capabilities": { "document": ["read", "addLayers"], "storage": true }
 }"#;

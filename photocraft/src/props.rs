@@ -45,17 +45,21 @@ use serde_json::{Map, Value, json};
 
 use crate::geom;
 
-/// The family TyperTools writes into a new style. It is a Windows font, so on Linux the panel
-/// replaces it with one the host actually has once `type.fonts` has answered
-/// ([`default_props_for`]); a library imported from Photoshop still names Tahoma, and the engine
-/// reports a missing font rather than silently substituting.
+/// The family TyperTools writes into a new style: `utils.js:162`, `getDefaultStyle()`'s
+/// `fontPostScriptName`/`fontName`. It is a Windows font, so on Linux the panel replaces it with one
+/// the host actually has once `type.fonts` has answered ([`default_props_for`]); a library imported
+/// from Photoshop still names Tahoma, and the engine reports a missing font rather than silently
+/// substituting.
 pub const DEFAULT_FONT: &str = "Tahoma";
 pub const DEFAULT_FONT_STYLE: &str = "Regular";
-/// TyperTools' default size, in `typeUnit` (pixels).
+/// TyperTools' default size, in `typeUnit` (pixels): `getDefaultStyle()`'s `size`.
 pub const DEFAULT_SIZE: f64 = 14.0;
-/// Photoshop's default auto-leading multiple, as TyperTools' default paragraph style carries it.
+/// The auto-leading multiple: TyperTools' own fallback, `editStyle.jsx:303`
+/// (`autoLeadingPercentage = 1.2` when auto-leading is switched off, and `120` is the field's
+/// placeholder at `:355`). `autoLeading: true` in `getDefaultStyle()` writes no percentage at all,
+/// so this is the number that stands behind it.
 pub const DEFAULT_AUTO_LEADING: f64 = 1.2;
-/// The ruler unit a new style is written in, as TyperTools writes it.
+/// The ruler unit a new style is written in, as `getDefaultStyle()` writes it.
 pub const DEFAULT_TYPE_UNIT: &str = "pixelsUnit";
 
 /// Superscript/subscript emulation: the size and the baseline shift as fractions of the size the

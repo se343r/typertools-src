@@ -616,7 +616,7 @@ fn help(p: &Panel) -> Vec<Value> {
     let mut out = vec![
         label("TyperTools for PhotoCraft"),
         muted(
-            "A lettering panel: paste a script, one line of dialogue per row, tag lines with a style's prefix, and put them into the page. It is a clean-room port of TyperTools 1.4.9 for Adobe Photoshop, MIT, © 2017 Swirt — the same behaviour, against PhotoCraft's own type engine.",
+            "A lettering panel: paste a script, one line of dialogue per row, tag lines with a style's prefix, and put them into the page. A port of TyperTools 1.4.9 for Adobe Photoshop, MIT, © 2017 Swirt — its strings, its style-library format and its geometry, against PhotoCraft's own type engine.",
         ),
         separator(),
         label("What is here"),
@@ -1090,5 +1090,7 @@ mod tests {
         assert!(dumped.contains("burasagari"), "{dumped}");
         assert!(dumped.contains("TyperTools 1.4.9"), "the port says what it is a port of");
         assert!(dumped.contains("2017 Swirt"), "and credits it");
+        assert!(dumped.contains("MIT"), "under the licence that allows the reuse");
+        assert!(!dumped.contains("clean-room"), "it is a port of that source, not an independent rewrite");
     }
 }

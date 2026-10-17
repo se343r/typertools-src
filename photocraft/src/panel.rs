@@ -215,6 +215,21 @@ impl Panel {
         self.lines.get(self.cursor)
     }
 
+    /// The unit the size buttons step in: the `typeUnit` of the style that would letter the current
+    /// line, or TyperTools' default when there is no style at all.
+    ///
+    /// TyperTools adds 1 to the *layer's* size in the layer's ruler unit, which Photoshop keeps per
+    /// layer; PhotoCraft's type is always in points. The library's own unit is therefore what says
+    /// how big a step is, and every library this port writes — and the one TyperTools writes — is in
+    /// pixels unless its author changed it in the editor.
+    fn step_unit(&self) -> String {
+        let line_style = self.current_line().and_then(|l| l.style_id.as_deref());
+        self.library
+            .current_style(line_style)
+            .map(|s| props::type_unit(&s.text_props).to_string())
+            .unwrap_or_else(|| props::DEFAULT_TYPE_UNIT.to_string())
+    }
+
     /// The dialogue number of the current line, 1-based, for the footer and the number field.
     pub fn line_number(&self) -> usize {
         match self.lines.get(self.cursor) {
@@ -299,6 +314,7 @@ impl Panel {
 
     fn init(&mut self, event: &Value) -> Vec<Value> {
         let storage = event.get("storage").and_then(Value::as_object);
+        let mut restored_line = 0usize;
         if let Some(s) = storage.and_then(|s| s.get(STORAGE_LIBRARY)).and_then(Value::as_str)
             && let Ok(v) = serde_json::from_str::<Value>(s)
         {
@@ -309,11 +325,17 @@ impl Panel {
         {
             self.scale = number(&v, "scale", 100.0).clamp(1.0, 999.0);
             self.page = Page::from_id(text(&v, "page").as_str());
+            // Restored after the script is parsed, since a row index is only meaningful against the
+            // rows that are there (and `settle` is what decides which one that is).
+            restored_line = number(&v, "line", 0.0).max(0.0) as usize;
         }
         if let Some(s) = storage.and_then(|s| s.get(STORAGE_SCRIPT)).and_then(Value::as_str) {
             self.script = s.to_string();
         }
         self.reparse();
+        if let Some(cursor) = crate::script::settle(&self.lines, restored_line) {
+            self.cursor = cursor;
+        }
         if self.library.styles.is_empty() {
             // Nothing stored: a letterer opening the panel for the first time gets something to work
             // with rather than an empty list and a blank page. The starter library is this port's own.
@@ -515,7 +537,7 @@ impl Panel {
                 {
                     self.cursor = at;
                 }
-                return self.reply(Vec::new());
+                return self.reply(self.save_settings());
             }
             "textScale" => {
                 self.scale = value.as_f64().filter(|n| n.is_finite()).unwrap_or(100.0).clamp(1.0, 999.0);
@@ -653,25 +675,27 @@ impl Panel {
         }
 
         match id {
+            // Moving the line stores where it landed: TyperTools' reducer writes its whole store on
+            // every action, so the line a letterer left the panel on is the line it comes back to.
             "prev" => {
                 if let Some(at) = script::previous(&self.lines, self.cursor) {
                     self.cursor = at;
                 }
-                self.reply(Vec::new())
+                self.reply(self.save_settings())
             }
             "next" => {
                 if let Some(at) = script::next(&self.lines, self.cursor) {
                     self.cursor = at;
                 }
-                self.reply(Vec::new())
+                self.reply(self.save_settings())
             }
             "first" => {
                 self.cursor = script::settle(&self.lines, 0).unwrap_or(0);
-                self.reply(Vec::new())
+                self.reply(self.save_settings())
             }
             "last" => {
                 self.cursor = script::settle(&self.lines, self.lines.len().saturating_sub(1)).unwrap_or(0);
-                self.reply(Vec::new())
+                self.reply(self.save_settings())
             }
             "create" => self.start(Kind::Create, None, false, at),
             "insert" => self.start(Kind::Insert, None, false, at),
@@ -844,7 +868,7 @@ impl Panel {
         self.act(step)
     }
 
-    /// The size buttons: one document pixel's worth of points, keeping the layer where it was.
+    /// The size buttons: one unit of the current style's own unit, keeping the layer where it was.
     ///
     /// One step, not two. TyperTools 1.4.9 carries a second stepper (`_changeSize_alt`, which would
     /// move by 0.2 mm / 1 px / 0.5 pt depending on the layer's ruler unit) but nothing calls it — the
@@ -861,7 +885,7 @@ impl Panel {
         }
         self.runs += 1;
         let mut run = Run::begin(Kind::Resize, format!("typertools-{}", self.runs), targets);
-        run.delta = direction * geom::size_step_pt(self.dpi());
+        run.delta = direction * geom::size_step_pt(self.dpi(), &self.step_unit());
         run.params = json!({});
         self.message = Some(Message::info(if direction > 0.0 { "Bigger…" } else { "Smaller…" }));
         self.run = Some(run);
@@ -1035,7 +1059,9 @@ impl Panel {
     }
 
     fn save_settings(&self) -> Vec<Value> {
-        let value = json!({"scale": self.scale, "page": self.page.id()}).to_string();
+        // The line as well as the settings: TyperTools stores `currentLineIndex`, so a letterer who
+        // closes the panel mid-chapter comes back to the line they were on rather than to the first.
+        let value = json!({"scale": self.scale, "page": self.page.id(), "line": self.cursor}).to_string();
         vec![json!({"op": "storage.set", "key": STORAGE_SETTINGS, "value": value})]
     }
 
@@ -1544,6 +1570,40 @@ mod tests {
     }
 
     #[test]
+    fn the_line_the_panel_is_left_on_is_the_line_it_comes_back_to() {
+        // TyperTools stores `currentLineIndex` on every state change, so a letterer who closes the
+        // panel mid-chapter resumes on the line they were lettering.
+        let mut h = H::fresh();
+        let script = "d. one\n## door\nx. two\n## the end\nd. three";
+        h.change("script", json!(script));
+        h.click("next");
+        h.click("next");
+        assert_eq!(h.p.cursor, 4);
+        let settings = h.find("storage.set").last().expect("moving a line stores it")["value"].clone();
+        assert!(settings.as_str().is_some_and(|s| s.contains("\"line\":4")), "{settings}");
+
+        // A new session with that storage: the same row, without the script being touched.
+        let mut out = H { p: Panel::new(), out: Vec::new() };
+        out.send(json!({"type": "init", "now": 10, "storage": {
+            "settings": settings,
+            "script": script,
+        }}));
+        assert_eq!(out.p.cursor, 4, "back on the line the panel was left on");
+
+        // A script that has since been shortened is not an error: a row that is no longer there
+        // settles on the first line that is, the way the ◀ ⏮ buttons do.
+        let mut out = H { p: Panel::new(), out: Vec::new() };
+        out.send(json!({"type": "init", "now": 10, "storage": {
+            "settings": settings,
+            "script": "## door\nd. only line",
+        }}));
+        assert_eq!(out.p.cursor, 1, "the first line there is, not a row that is gone");
+
+        // And a first run, with nothing stored at all, still starts where it did.
+        assert_eq!(H::fresh().p.cursor, 0);
+    }
+
+    #[test]
     fn an_answer_to_something_the_panel_did_not_ask_is_dropped() {
         let mut h = H::fresh();
         h.doc();
@@ -1621,14 +1681,28 @@ mod tests {
     }
 
     #[test]
-    fn the_size_buttons_step_by_a_document_pixel() {
+    fn the_size_buttons_step_by_one_of_the_styles_own_units() {
         let mut h = H::fresh();
         h.doc();
         h.click("sizeUp");
         assert_eq!(h.first_call(), "type.info", "a resize starts by measuring the layer");
         assert_eq!(h.p.run.as_ref().map(|r| r.kind), Some(Kind::Resize));
+        // The starter styles are written in points, so a press is a point. TyperTools adds 1 to the
+        // size in the unit the style is written in, and this is that same rule.
+        let delta = h.p.run.as_ref().map(|r| r.delta).unwrap_or(0.0);
+        assert!((delta - 1.0).abs() < 1e-9, "one point, the style's own unit: {delta}");
+
+        // A library in pixels — TyperTools' own default unit, and what most imported libraries say —
+        // steps one *document pixel*, which is a quarter of a point on a 300 dpi page.
+        let mut h = H::fresh();
+        h.doc();
+        if let Some(s) = h.p.library.styles.first_mut() {
+            s.text_props["typeUnit"] = json!("pixelsUnit");
+        }
+        h.click("sizeUp");
         let delta = h.p.run.as_ref().map(|r| r.delta).unwrap_or(0.0);
         assert!((delta - 72.0 / 300.0).abs() < 1e-9, "one document pixel in points: {delta}");
+
         // With no type layer to work on, nothing starts.
         let mut h = H::fresh();
         h.answer("doc.info", true, json!({"width": 10, "height": 10, "resolution": 72, "layers": []}));

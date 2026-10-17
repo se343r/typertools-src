@@ -19,10 +19,25 @@
 //!   shadows `##` on a later one;
 //! * exactly **one** style prefix is taken off a line.
 //!
-//! One rule is deliberately *not* ported: TyperTools splits on `\n` alone, so a script pasted from
-//! Windows keeps a `\r` at the end of every line. That is invisible in the text (it is trimmed) but
-//! it can hide a line's last character from anything that inspects the raw line, and there is no
-//! reason to reproduce it. Carriage returns are stripped here, and a test says so.
+//! Three rules are deliberately *not* ported, all of them for the same reason — each one is a way
+//! for a script to lose or acquire text that the letterer did not ask for, and none of them is
+//! something anyone could be relying on:
+//!
+//! * **A prefix is taken off the front, not out of the middle.** TyperTools does
+//!   `rawText.replace(prefix, '')`, which removes *every* occurrence of it anywhere in the line. Its
+//!   prefixes are short (`d:`, `#`, `x`), so a line like `# I said #1!` comes out of the original as
+//!   `I said 1!` — the dialogue loses a character for the crime of containing its own tag. Here the
+//!   prefix is stripped from the front only ([`str::strip_prefix`]).
+//! * **An empty prefix matches nothing.** In the original `rawText.startsWith('')` is true for every
+//!   line, so an empty style prefix silently claims the whole script, including the untagged lines
+//!   the default style is meant to have. Here an empty prefix is skipped, which is what a blank field
+//!   in the style editor means.
+//! * **A pasted script has no carriage returns.** TyperTools splits on `\n` alone, so a script
+//!   pasted from Windows keeps a `\r` at the end of every line. That is invisible in the text (it is
+//!   trimmed) but it can hide a line's last character from anything that inspects the raw line, and
+//!   there is no reason to reproduce it. Carriage returns are stripped here.
+//!
+//! Each one has a test that says what the difference is.
 
 /// One row of the script.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,6 +244,31 @@ mod tests {
         assert_eq!(lines[0].raw, "d: One");
         assert_eq!(lines[1].text, "Two");
         assert!(lines[2].ignored, "the trailing newline leaves one empty row");
+    }
+
+    #[test]
+    fn only_the_prefix_at_the_front_of_a_line_is_taken_off() {
+        // The original replaces every occurrence: `#`.replace would give `I said 1!`, losing a
+        // character of the dialogue because it happens to contain its own tag.
+        let lines = parse("# I said #1!\nd: d: two", &[], &prefixes());
+        assert_eq!(lines[0].text, "I said #1!");
+        assert_eq!(lines[1].text, "d: two", "and a prefix inside the dialogue stays too");
+        // The ignore prefix is stripped the same way, and an ignored line's text is not lettered
+        // whatever it holds.
+        let lines = parse("## note ## again", &ignored(), &prefixes());
+        assert!(lines[0].ignored);
+        assert_eq!(lines[0].text, "note ## again");
+    }
+
+    #[test]
+    fn an_empty_prefix_matches_nothing() {
+        // In the original `startsWith('')` is true for every row, so a prefix left blank in the
+        // style editor would claim the whole script — untagged lines included.
+        let empty_style = vec![("dialogue".to_string(), String::new()), ("shout".to_string(), "#".to_string())];
+        let lines = parse("plain\n# BANG", &[String::new()], &empty_style);
+        assert_eq!(lines[0].style_id, None, "a blank prefix is not a prefix");
+        assert!(!lines[0].ignored);
+        assert_eq!(lines[1].style_id.as_deref(), Some("shout"));
     }
 
     #[test]
