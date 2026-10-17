@@ -14,14 +14,16 @@
 //!   tracking or a 300-character style name; [`number`] and [`label`] fit them to the range the
 //!   widget set can express. A refusal here would take the whole panel down over one bad style.
 //!
-//! What the panel *cannot* show, and says so in Help: a colour swatch (there is no colour widget in
-//! ABI v2, so a style's prefix colour is text), a rendered preview of a line in its own font (no
-//! panel-side rasterisation), and a drag-reorder list (no drag widget — reordering is two buttons in
-//! the style editor).
+//! What the panel draws depends on what this host says it has (`init.host.widgets`). A host that
+//! draws `list`, `scroll`, `label.color`, `label.font` and `button.icon` gets TypeR's own shape: a
+//! line-numbered script list with the line it is working on highlighted, style names set in their
+//! own font beside a colour swatch, glyph buttons and independently scrolling panes. A host without
+//! them gets the plain page this module has always sent — and says so in Help, since a colour
+//! swatch or a gutter that was never sent reads as a missing feature, not as a host that lacks one.
 
 use serde_json::{Value, json};
 
-use crate::library::PREFIX_COLORS;
+use crate::library::{PREFIX_COLORS, Style};
 use crate::panel::{Page, Panel};
 use crate::props;
 use crate::script;
@@ -38,6 +40,10 @@ pub const LABEL_MAX: usize = 256;
 /// view; three per row plus the editor leaves room for fifty styles, which is more than a letterer
 /// scrolls past. Everything beyond is reachable by prefix and by the JSON editor.
 pub const MAX_ROWS: usize = 50;
+
+/// The most rows a `list` widget holds (the host's `view::MAX_LIST_ROWS`). A longer script keeps
+/// its rows in the script box; the list is a view of what it can draw.
+pub const LIST_MAX: usize = 1000;
 
 // --- builders ---------------------------------------------------------------------------------
 
@@ -78,11 +84,86 @@ pub fn error(text: impl AsRef<str>) -> Value {
     json!({"type": "label", "text": cut(text.as_ref()), "level": "error"})
 }
 
+/// A label the host may draw in a colour (`#rrggbb`) and a host font family. Both are left out when
+/// they would fail the host's checks rather than sent and refused with the whole view: a library is
+/// JSON a letterer can edit, and one odd colour must not cost them the panel.
+fn styled(text: impl AsRef<str>, color: Option<&str>, font: Option<&str>) -> Value {
+    let mut v = json!({"type": "label", "text": cut(text.as_ref())});
+    if let Some(c) = color.filter(|c| is_hex(c)) {
+        v["color"] = json!(c);
+    }
+    if let Some(f) = font.filter(|f| !f.is_empty()) {
+        v["font"] = json!(cut_to(f, FONT_MAX));
+    }
+    v
+}
+
+/// The family a style letters in, for a label that sets the text in its own font — `None` when this
+/// host does not draw label fonts, or the style names none yet (a starter style laid down before the
+/// host listed its fonts).
+fn family_font(p: &Panel, props: &Value) -> Option<String> {
+    if !p.has("label.font") {
+        return None;
+    }
+    let family = props::family(props);
+    (!family.is_empty()).then_some(family)
+}
+
 /// A button. `enabled: false` greys it out and the host sends nothing when it is pressed — the panel
 /// says what it cannot do rather than offering a button that refuses.
 pub fn button(id: &str, text: impl AsRef<str>, primary: bool, enabled: bool) -> Value {
     json!({"type": "button", "id": id, "label": cut(text.as_ref()), "primary": primary, "enabled": enabled})
 }
+
+/// A button that draws a glyph, with `tooltip` as its hover hint (the host's `button.icon`). The
+/// icon is cut to the eight characters the host accepts: a caller passing a word gets a glyph
+/// button it can still press, not a refused view.
+pub fn icon_button(id: &str, icon: &str, tooltip: &str, primary: bool, enabled: bool) -> Value {
+    json!({
+        "type": "button", "id": id, "label": cut(tooltip), "icon": cut_to(icon, 8),
+        "primary": primary, "enabled": enabled,
+    })
+}
+
+/// A list of single-line rows. `selected` is the row the host highlights, 0-based; `numbered` adds
+/// the host's line-number gutter. A click sends `ui.click` with the row's index as its value.
+pub fn list(id: &str, selected: Option<usize>, numbered: bool, rows: Vec<Value>) -> Value {
+    let rows: Vec<Value> = rows.into_iter().take(LIST_MAX).collect();
+    json!({"type": "list", "id": id, "selected": selected, "numbered": numbered, "rows": rows})
+}
+
+/// One row of a [`list`]: its text, and optionally the colour (`#rrggbb`) and font family the host
+/// draws it in. Both are cut to what the host accepts rather than allowing one odd style to refuse
+/// the whole view.
+pub fn list_row(text: impl AsRef<str>, color: Option<&str>, font: Option<&str>) -> Value {
+    let mut row = json!({"text": cut_to(text.as_ref(), LIST_ROW_CHARS)});
+    if let Some(c) = color.filter(|c| is_hex(c)) {
+        row["color"] = json!(c);
+    }
+    if let Some(f) = font.filter(|f| !f.is_empty()) {
+        row["font"] = json!(cut_to(f, FONT_MAX));
+    }
+    row
+}
+
+/// A pane with its own scrollbar and a pinned footer. Height-less panes in a column share the free
+/// height by `weight`, so the script and the library scroll independently and neither pushes the
+/// other off the panel.
+pub fn scroll(id: &str, weight: u8, children: Vec<Value>, footer: Vec<Value>) -> Value {
+    json!({"type": "scroll", "id": id, "weight": weight.clamp(1, 16), "children": children, "footer": footer})
+}
+
+/// Whether `c` is a `#rrggbb` colour, which is the only shape the host's colour fields accept.
+fn is_hex(c: &str) -> bool {
+    c.strip_prefix('#').is_some_and(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The longest family name the host resolves (its `view::MAX_FONT_NAME`).
+pub const FONT_MAX: usize = 128;
+
+/// The longest text one list row carries. A script row can be as long as the script; the list draws
+/// one line and elides it, so carrying more than a wide panel can show is memory spent for nothing.
+pub const LIST_ROW_CHARS: usize = 400;
 
 /// A field. `max_length` is the host's cap on what can be typed into it — and on what it will carry,
 /// so a value longer than its own field holds is cut here rather than refused by the host: a style
@@ -362,7 +443,13 @@ fn top(p: &Panel) -> Vec<Value> {
     } else {
         label(format!("Line {} / {}", p.cursor.min(rows - 1) + 1, rows))
     };
-    vec![counter, line_preview(p), context(p)]
+    let mut out = vec![counter, line_preview(p)];
+    // The context window was this port's stand-in for TypeR's line list. A host that draws a
+    // `list` gets the real one in the script pane, so the stand-in would only say it twice.
+    if !p.has("list") {
+        out.push(context(p));
+    }
+    out
 }
 
 /// Characters of dialogue a row in [`context`] shows. Six rows of this, a line number and a marker
@@ -402,9 +489,20 @@ fn context(p: &Panel) -> Value {
 // --- Lettering ---------------------------------------------------------------------------------
 
 /// The three panes, in TypeR's order: the preview (the line and what the buttons will do with it),
-/// the script, and the style library. A panel cannot set pane heights, so each pane is as tall as
-/// its widgets and the order is what carries the layout.
+/// the script, and the style library.
+///
+/// A host that draws `scroll` gets TypeR's own layout: the preview above, then the script and the
+/// library as panes with their own scrollbars and pinned footers, so a long script does not push the
+/// style list out of reach and the actions do not scroll away. The plain layout stacks everything in
+/// one scroll area, in the same order.
 fn lettering(p: &Panel) -> Vec<Value> {
+    if p.has("scroll") {
+        let mut out = preview_pane(p);
+        out.push(separator());
+        out.push(scroll("scriptPane", 2, script_pane(p), script_footer(p)));
+        out.push(scroll("stylesPane", 3, styles(p), styles_footer(p)));
+        return out;
+    }
     let mut out = preview_pane(p);
     out.push(separator());
     out.extend(script_pane(p));
@@ -412,8 +510,18 @@ fn lettering(p: &Panel) -> Vec<Value> {
     out.push(separator());
     out.extend(styles(p));
     out.push(separator());
-    out.push(row(vec![button("openSettings", "Settings", false, true), button("openHelp", "Help", false, true)]));
+    out.extend(styles_footer(p));
     out
+}
+
+/// A navigation button: a glyph with a tooltip where the host draws icons, the glyph alone where it
+/// does not (which is how this panel has always drawn them).
+fn nav(p: &Panel, id: &str, icon: &str, tooltip: &str, enabled: bool) -> Value {
+    if p.has("button.icon") {
+        icon_button(id, icon, tooltip, false, enabled)
+    } else {
+        button(id, icon, false, enabled)
+    }
 }
 
 /// The preview pane: the current line and its neighbours, the scale, the actions and the size steps.
@@ -424,10 +532,10 @@ fn preview_pane(p: &Panel) -> Vec<Value> {
         row(vec![
             label("Line"),
             number("lineNo", p.line_number() as f64, 1.0, script::count(&p.lines).max(1) as f64, 1.0, false),
-            button("prev", "◀", false, !working),
-            button("next", "▶", false, !working),
-            button("first", "⏮", false, !working),
-            button("last", "⏭", false, !working),
+            nav(p, "prev", "◀", "Previous line", !working),
+            nav(p, "next", "▶", "Next line", !working),
+            nav(p, "first", "⏮", "First line", !working),
+            nav(p, "last", "⏭", "Last line", !working),
         ]),
         separator(),
         row(vec![label("Text size"), number("textScale", p.scale, 1.0, 999.0, 1.0, true), label("%")]),
@@ -435,8 +543,8 @@ fn preview_pane(p: &Panel) -> Vec<Value> {
         separator(),
         row(vec![button("create", "Create", true, !working), button("insert", "Insert", false, !working), button("align", "Align", false, !working)]),
         row(vec![
-            button("sizeDown", "A−", false, !working),
-            button("sizeUp", "A+", false, !working),
+            nav(p, "sizeDown", "A−", "Smaller type", !working),
+            nav(p, "sizeUp", "A+", "Larger type", !working),
             button("apply", "Apply style", false, !working),
             button("applyKeep", "Apply, keep size", false, !working),
         ]),
@@ -452,20 +560,72 @@ fn preview_pane(p: &Panel) -> Vec<Value> {
     out
 }
 
-/// The script pane: the field, and the line the preview pane is on.
+/// The script pane: the field, and — where the host draws a list — TypeR's line list above it, with
+/// each row's number in the gutter and the line being worked on highlighted.
 fn script_pane(p: &Panel) -> Vec<Value> {
     let hidden = p.hide_done && !p.done.is_empty();
     let hint = if hidden { format!("{} finished row(s) hidden", p.done.len()) } else { "one line of dialogue per row".to_string() };
-    vec![
-        row(vec![label("Script"), muted(hint)]),
-        text(
-            "script",
-            &clip(&p.visible_script()),
-            "One line of dialogue per row. Start a line with a style's prefix to set it in that style.",
-            true,
-            SCRIPT_MAX,
-        ),
-    ]
+    let mut out = vec![row(vec![label("Script"), muted(hint)])];
+    if p.has("list") {
+        out.push(script_list(p));
+        if p.lines.len() > LIST_MAX {
+            out.push(warning(format!(
+                "The list shows the first {LIST_MAX} lines; the script box below still holds all {}.",
+                p.lines.len()
+            )));
+        }
+    }
+    out.push(text(
+        "script",
+        &clip(&p.visible_script()),
+        "One line of dialogue per row. Start a line with a style's prefix to set it in that style.",
+        true,
+        SCRIPT_MAX,
+    ));
+    out
+}
+
+/// The script as a `list`: the raw rows in order, the line being worked on selected, and a ✓ on the
+/// rows already lettered. With finished rows hidden the list leaves them out, so the host's own
+/// gutter would number 1..n where the script's numbers are different — the row then carries its own
+/// number instead, and the gutter is only asked for when the numbers are the script's.
+fn script_list(p: &Panel) -> Value {
+    let raw = p.list_rows();
+    let numbered = !(p.hide_done && !p.done.is_empty());
+    let rows: Vec<Value> = raw
+        .iter()
+        .filter_map(|i| {
+            let line = p.lines.get(*i)?;
+            let marker = if p.done.contains(i) { "✓ " } else { "" };
+            let body = if line.raw.trim().is_empty() { "(no text)" } else { line.raw.as_str() };
+            let text = if numbered { format!("{marker}{body}") } else { format!("{marker}{:>4} {body}", i + 1) };
+            Some(list_row(text, None, None))
+        })
+        .collect();
+    let selected = raw.iter().position(|i| *i == p.cursor);
+    list("scriptLine", selected, numbered, rows)
+}
+
+/// The script pane's pinned footer: the hide-finished switch and how many are hidden, visible however
+/// far down the script the letterer has scrolled.
+fn script_footer(p: &Panel) -> Vec<Value> {
+    let count = p.done.len();
+    let hint = if count == 0 { "No rows finished yet".to_string() } else { format!("{count} finished row(s), marked ✓") };
+    vec![row(vec![toggle("hideDone", p.hide_done, "Hide finished lines"), muted(hint)])]
+}
+
+/// The library pane's pinned footer: the three presses that are always wanted, whatever the library
+/// is scrolled to.
+fn styles_footer(p: &Panel) -> Vec<Value> {
+    let mut line = vec![button("newStyle", "New style", false, true)];
+    if p.has("button.icon") {
+        line.push(icon_button("openSettings", "⚙", "Settings", false, true));
+        line.push(icon_button("openHelp", "?", "Help", false, true));
+    } else {
+        line.push(button("openSettings", "Settings", false, true));
+        line.push(button("openHelp", "Help", false, true));
+    }
+    vec![row(line)]
 }
 
 /// The finished rows: a collapsed section with the option to leave them out of the script box, and
@@ -503,14 +663,23 @@ fn line_preview(p: &Panel) -> Value {
         None => ("(no style)".to_string(), "-".to_string()),
     };
     let text = if line.ignored { "(ignored)".to_string() } else { line.text.clone() };
-    let mut out = vec![label(format!("{name}: {text}"))];
+    // The line preview is set in the style's own font where the host draws label fonts: the
+    // typeface behind the line is visible in the preview, as TypeR's own preview shows it.
+    let font = style.and_then(|s| family_font(p, &s.text_props));
+    let mut out = vec![styled(format!("{name}: {text}"), None, font.as_deref())];
     if line.ignored {
         out.push(muted(match &line.ignore_prefix {
             Some(prefix) => format!("This line starts with the ignore prefix {prefix:?}, so the buttons skip it."),
             None => "This line has no text, so the buttons skip it.".to_string(),
         }));
     } else {
-        out.push(muted(if colour == "-" { String::new() } else { format!("Prefix colour {colour} (this host has no colour widget to draw it with)") }));
+        out.push(muted(if colour == "-" {
+            String::new()
+        } else if p.has("label.color") {
+            format!("Prefix colour {colour}, shown on the style's row")
+        } else {
+            format!("Prefix colour {colour} (this host has no colour widget to draw it with)")
+        }));
     }
     column(out)
 }
@@ -522,34 +691,28 @@ fn styles(p: &Panel) -> Vec<Value> {
     if p.library.styles.is_empty() {
         out.push(muted("The library is empty. Make a style here, or load the starter library from Help."));
     }
-    for (i, s) in p.library.styles.iter().take(MAX_ROWS).enumerate() {
-        let folder = s.folder.as_ref().and_then(|f| p.library.folders.iter().find(|x| x.id == *f)).map(|f| f.name.clone());
-        let prefixes = s.prefixes.join(" ");
-        let where_ = folder.map(|f| format!(" · {f}")).unwrap_or_default();
-        let prefix = if prefixes.is_empty() { " (no prefix)".to_string() } else { format!(" [{prefixes}]") };
-        let disabled = if s.prefixes_disabled { " (prefixes off)" } else { "" };
-        let mut line = vec![label(format!("{}{prefix}{where_}{disabled}", s.name))];
-        if p.quick_size {
-            // TypeR's quick style size (`stylesBlock.jsx`): a step down, the size in the style's
-            // own unit, and a step up, right on the row.
-            let size = props::char(&s.text_props, "size").and_then(Value::as_f64);
-            let step = if p.style_step.is_finite() && p.style_step > 0.0 { p.style_step } else { 0.1 };
-            line.push(button(&format!("s{i}_sizeDown"), "−", false, !busy(p)));
-            line.push(number(&format!("s{i}_size"), size.unwrap_or(14.0), 1.0, 1296.0, step, false));
-            line.push(button(&format!("s{i}_sizeUp"), "+", false, !busy(p)));
-        }
-        line.push(button(&format!("s{i}_apply"), "Apply", false, !busy(p)));
-        line.push(button(&format!("s{i}_edit"), "Edit", false, !busy(p)));
-        out.push(row(line));
-        // Under the row rather than in it: the name row is already sharing its width with the size
-        // step and the two buttons, and a font pasted after the name would be clipped off the right
-        // edge of a 250 px panel.
-        out.push(muted(format!("Font: {}", font_summary(&s.text_props))));
+    let mut drawn = 0usize;
+    // TypeR lists the styles in no folder first, then each folder's styles under its name, in tree
+    // order. The grouping is the library's own: it is what decides which prefix wins.
+    let unsorted = p.library.styles_in(None);
+    if !unsorted.is_empty() {
+        out.push(muted("No folder"));
+        draw_styles(&mut out, p, &unsorted, &mut drawn);
     }
-    if p.library.styles.len() > MAX_ROWS {
+    for id in p.library.folder_order() {
+        let Some(f) = p.library.folder(&id) else { continue };
+        let in_folder = p.library.styles_in(Some(f.id.as_str()));
+        if in_folder.is_empty() {
+            continue;
+        }
+        let indent = "  ".repeat(p.library.folder_depth(&f.id));
+        out.push(muted(format!("{indent}{} ({} style(s))", f.name, in_folder.len())));
+        draw_styles(&mut out, p, &in_folder, &mut drawn);
+    }
+    if p.library.styles.len() > drawn {
         out.push(warning(format!(
             "{} more styles than this page draws; use a prefix in the script, or edit the JSON in Help.",
-            p.library.styles.len() - MAX_ROWS
+            p.library.styles.len() - drawn
         )));
     }
     out.push(separator());
@@ -558,8 +721,61 @@ fn styles(p: &Panel) -> Vec<Value> {
         let current = p.library.default_style_id.clone().unwrap_or_else(|| options.first().map(|(v, _)| v.clone()).unwrap_or_default());
         out.push(row(vec![muted("Style for lines with no prefix"), choice("defaultStyle", &current, options)]));
     }
-    out.push(row(vec![button("newStyle", "New style", false, true)]));
     out
+}
+
+/// Draws styles until the page is full. Their ids carry their place in the library array, which is
+/// the order the panel's handler indexes, not their place inside a folder.
+fn draw_styles(out: &mut Vec<Value>, p: &Panel, styles: &[&Style], drawn: &mut usize) {
+    for s in styles {
+        if *drawn >= MAX_ROWS {
+            break;
+        }
+        let Some(i) = p.library.styles.iter().position(|x| x.id == s.id) else { continue };
+        *drawn += 1;
+        out.push(style_row(p, i, s));
+        // A host that sets each name in its own font has already answered "which face is this?".
+        // One that cannot still gets the answer in words, as it always has.
+        if !p.has("label.font") {
+            out.push(muted(format!("Font: {}", font_summary(&s.text_props))));
+        }
+    }
+}
+
+/// One style: its text colour as a swatch, its name in its own font (where the host draws those),
+/// the quick size editor when it is on, and the apply/edit buttons.
+fn style_row(p: &Panel, i: usize, s: &Style) -> Value {
+    let working = busy(p);
+    let mut line = Vec::new();
+    if p.has("label.color") {
+        // TypeR's style item carries two swatches: the colour the style letters in, and the colour
+        // of its prefix chip. A style with no prefixes has no chip, so it gets one square.
+        let colour = props::color_hex(&s.text_props);
+        line.push(styled("■", Some(&colour), None));
+        if !s.prefixes.is_empty() {
+            line.push(styled("■", Some(&s.prefix_color), None));
+        }
+    }
+    let mut name = s.name.clone();
+    if !s.prefixes.is_empty() {
+        name.push_str(&format!(" [{}]", s.prefixes.join(" ")));
+    }
+    if s.prefixes_disabled {
+        name.push_str(" (prefixes off)");
+    }
+    line.push(styled(name, None, family_font(p, &s.text_props).as_deref()));
+    if p.quick_size {
+        // TypeR's quick style size (`stylesBlock.jsx`): a step down, the size in the style's own
+        // unit, and a step up, right on the row.
+        let size = props::char(&s.text_props, "size").and_then(Value::as_f64);
+        let step = if p.style_step.is_finite() && p.style_step > 0.0 { p.style_step } else { 0.1 };
+        line.push(nav(p, &format!("s{i}_sizeDown"), "−", "Smaller", !working));
+        line.push(number(&format!("s{i}_size"), size.unwrap_or(14.0), 1.0, 1296.0, step, false));
+        line.push(nav(p, &format!("s{i}_sizeUp"), "+", "Larger", !working));
+    }
+    line.push(button(&format!("s{i}_apply"), "Apply", false, !working));
+    line.push(button(&format!("s{i}_edit"), "Edit", false, !working));
+    row(line)
 }
 
 // --- Style editor ------------------------------------------------------------------------------
@@ -867,8 +1083,20 @@ fn help(p: &Panel) -> Vec<Value> {
         muted(
             "Keyboard shortcuts: a panel cannot add any — ABI v2 has no command or shortcut contribution, so the three actions are these buttons. Nothing is lost, but they need the panel to have focus.",
         ),
-        muted("A coloured preview of a line, and the prefix colour itself: this host has no colour widget, so a prefix's colour is written out as text."),
-        muted("TypeR's draggable pane divider and script gutter: the widget set has neither a divider nor a gutter. The panes keep TypeR's order at their own content height, and the line number and style are named in the preview pane."),
+    ];
+    // The gaps are the host's, and a host that has grown the widget is no longer missing it. Say
+    // which, rather than either claiming a gap that is gone or pretending the plain layout is it.
+    if p.has("label.color") && p.has("label.font") {
+        out.push(muted("A line is previewed in its style's own font, and each style's row carries its text colour and prefix colour as swatches."));
+    } else {
+        out.push(muted("A coloured preview of a line, and the prefix colour itself: this host has no colour widget, so a prefix's colour is written out as text."));
+    }
+    if p.has("list") && p.has("scroll") {
+        out.push(muted("TypeR's draggable pane divider: the script and the library keep a fixed share of the height instead. The script list is line-numbered, the line being worked on is highlighted, and a row can be clicked to work on it."));
+    } else {
+        out.push(muted("TypeR's draggable pane divider and script gutter: the widget set has neither a divider nor a gutter. The panes keep TypeR's order at their own content height, and the line number and style are named in the preview pane."));
+    }
+    out.extend([
         muted(
             "Importing or exporting the library as a file: the ABI has no file dialogs, so the JSON is shown in the box below to copy out or paste in. The full export is TypeR's own `TypeR_Export.json` shape; a folder's Export button writes its single-folder shape, which this port can also load.",
         ),
@@ -892,7 +1120,7 @@ fn help(p: &Panel) -> Vec<Value> {
             p.library.styles.len(),
             p.library.folders.len()
         )),
-    ];
+    ]);
     out.push(separator());
     out.push(muted("Starter library: dialogue, whisper, shout and thought styles, a sound-effect style, and the ## ignore prefix."));
     out
@@ -925,13 +1153,21 @@ mod tests {
     use crate::panel::Panel;
     use std::collections::BTreeSet;
 
+    /// The widget features the host advertises when it draws everything this module can use.
+    fn all_widgets() -> Vec<String> {
+        ["list", "scroll", "label.color", "label.font", "button.icon"].iter().map(|s| s.to_string()).collect()
+    }
+
     /// A panel in each state a page has to survive: one that has never been used, one with a real
-    /// document, a script and a library, and one with a style open in the editor.
+    /// document, a script and a library, and one with a style open in the editor. The used one
+    /// advertises every new widget, so the pages are checked in both the plain and the TypeR-shaped
+    /// layout.
     fn panels() -> Vec<(&'static str, Panel)> {
         let mut fresh = Panel::new();
         fresh.page = Page::Styles;
 
         let mut used = Panel::new();
+        used.widgets = all_widgets();
         used.doc = Doc::from_json(&json!({
             "width": 2000, "height": 3000, "resolution": 300,
             "activeLayer": 4, "selectedLayers": [4], "hasSelection": true,
@@ -983,6 +1219,37 @@ mod tests {
             "label" | "button" | "section" | "toggle" => {
                 let text = w.get("text").or_else(|| w.get("label")).or_else(|| w.get("title")).and_then(Value::as_str).unwrap_or_default();
                 assert!(text.chars().count() <= 256, "a label is over 256 characters: {text}");
+                if let Some(icon) = w.get("icon").and_then(Value::as_str) {
+                    assert!(!icon.is_empty() && icon.chars().count() <= 8, "an icon over 8 characters: {icon:?}");
+                }
+                if let Some(c) = w.get("color").and_then(Value::as_str) {
+                    assert!(is_hex(c), "{c:?} is not a #rrggbb colour: {w}");
+                }
+                if let Some(f) = w.get("font").and_then(Value::as_str) {
+                    assert!(!f.is_empty() && f.chars().count() <= FONT_MAX, "bad label font: {w}");
+                }
+            }
+            "list" => {
+                let rows = w["rows"].as_array().cloned().unwrap_or_default();
+                assert!(rows.len() <= 1000, "a list over 1000 rows: {}", rows.len());
+                if let Some(selected) = w.get("selected").and_then(Value::as_u64) {
+                    assert!((selected as usize) < rows.len(), "a list's selected row is not drawn: {w}");
+                }
+                for row in &rows {
+                    let text = row["text"].as_str().unwrap_or_default();
+                    assert!(!text.is_empty(), "a row with no text: {row}");
+                    if let Some(c) = row.get("color").and_then(Value::as_str) {
+                        assert!(is_hex(c), "{c:?} is not a #rrggbb colour: {row}");
+                    }
+                    if let Some(f) = row.get("font").and_then(Value::as_str) {
+                        assert!(!f.is_empty() && f.chars().count() <= FONT_MAX, "bad row font: {row}");
+                    }
+                }
+            }
+            "scroll" => {
+                let weight = w["weight"].as_u64().unwrap_or(1);
+                assert!((1..=16).contains(&weight), "a scroll weight outside 1..=16: {w}");
+                assert!(!w["children"].is_null(), "a scroll with no children field: {w}");
             }
             "number" => {
                 let (v, lo, hi, step) = (
@@ -1015,6 +1282,13 @@ mod tests {
                 walk(child, depth + 1, count, seen);
             }
         }
+        // A pane's pinned footer is part of the tree the host checks, so it is part of the tree this
+        // check walks.
+        if let Some(footer) = w.get("footer").and_then(Value::as_array) {
+            for child in footer {
+                walk(child, depth + 1, count, seen);
+            }
+        }
     }
 
     #[test]
@@ -1033,9 +1307,105 @@ mod tests {
         }
     }
 
+    /// The `list` widget with this id, if the view has one.
+    fn find_list<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
+        if v.get("type").and_then(Value::as_str) == Some("list") && v.get("id").and_then(Value::as_str) == Some(id) {
+            return Some(v);
+        }
+        for key in ["children", "footer"] {
+            if let Some(list) = v.get(key).and_then(Value::as_array)
+                && let Some(found) = list.iter().find_map(|c| find_list(c, id))
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     #[test]
-    fn every_style_row_says_which_font_it_letters_in() {
-        // TypeR's library is a row per style type — Dialogue, Whisper, Shout… — and the typeface
+    fn a_host_that_draws_the_new_widgets_gets_type_rs_shape() {
+        // The whole point of `init.host.widgets`: this host can draw TypeR's own layout — a
+        // line-numbered script list with the current line highlighted, style names in their own
+        // fonts beside colour swatches, glyph buttons, and panes that scroll independently.
+        let mut p = Panel::new();
+        p.widgets = all_widgets();
+        p.library = starter(Some("Inter"));
+        p.script = "d. one\nx. BANG\nd. three".into();
+        p.reparse();
+        p.cursor = 1;
+        p.done.insert(0);
+        let view = render(&p);
+        check(&view);
+        let dumped = view.to_string();
+        assert!(dumped.contains("\"type\":\"scroll\""), "the panes scroll independently: {dumped}");
+        assert!(dumped.contains("\"id\":\"scriptLine\""), "the script is a list: {dumped}");
+        let list = find_list(&view, "scriptLine").expect("the script list is drawn");
+        assert_eq!(list["numbered"], json!(true), "the host draws the gutter: {list}");
+        assert_eq!(list["selected"], json!(1), "and marks the line being worked on: {list}");
+        assert_eq!(list["rows"].as_array().map(Vec::len), Some(3), "every script row is a row: {list}");
+        assert!(list["rows"][0]["text"].as_str().unwrap_or_default().starts_with("✓ "), "a finished row is marked: {list}");
+        assert!(dumped.contains("\"font\":\"Inter\""), "style names in their own font: {dumped}");
+        assert!(dumped.contains("\"color\":\"#"), "and a colour swatch: {dumped}");
+        assert!(dumped.contains("\"icon\":\"◀\""), "glyph buttons: {dumped}");
+        // The five-row context label was the stand-in for this list; it is not drawn twice.
+        assert!(multi_line_label(&view).is_none());
+    }
+
+    #[test]
+    fn a_host_without_the_new_widgets_gets_the_plain_page() {
+        // One module, two hosts: nothing new may be sent to a host that never advertised it.
+        let mut p = Panel::new();
+        p.library = starter(Some("Inter"));
+        p.script = "d. one\nd. two".into();
+        p.reparse();
+        let view = render(&p);
+        check(&view);
+        let dumped = view.to_string();
+        for absent in ["\"type\":\"scroll\"", "\"type\":\"list\"", "\"icon\":", "\"font\":", "\"color\":"] {
+            assert!(!dumped.contains(absent), "{absent} was sent to a host that lacks it: {dumped}");
+        }
+        // The stand-ins are still there: the context window and the written-out font of each style.
+        assert!(multi_line_label(&view).is_some());
+        assert!(dumped.contains("Font: Inter"), "{dumped}");
+    }
+
+    #[test]
+    fn a_script_longer_than_the_list_is_cut_to_what_the_host_draws() {
+        let mut p = Panel::new();
+        p.widgets = all_widgets();
+        p.library = starter(None);
+        p.script = (0..LIST_MAX + 5).map(|i| format!("d. line {i}")).collect::<Vec<_>>().join("\n");
+        p.reparse();
+        let view = render(&p);
+        check(&view);
+        let list = find_list(&view, "scriptLine").expect("the script list is drawn");
+        assert_eq!(list["rows"].as_array().map(Vec::len), Some(LIST_MAX), "the list stops at the host's cap");
+        assert!(view.to_string().contains("shows the first 1000 lines"), "and says the rest is in the script box");
+    }
+
+    #[test]
+    fn a_hidden_finished_row_keeps_the_numbers_it_has_in_the_script() {
+        // With rows hidden the host's gutter would count 1..n over the rows that are left, which
+        // are not the script's numbers. The row carries its own number instead.
+        let mut p = Panel::new();
+        p.widgets = all_widgets();
+        p.library = starter(None);
+        p.script = "d. one\nd. two\nd. three".into();
+        p.reparse();
+        p.hide_done = true;
+        p.done.insert(0);
+        let view = render(&p);
+        check(&view);
+        let list = find_list(&view, "scriptLine").expect("the script list is drawn");
+        assert_eq!(list["numbered"], json!(false), "{list}");
+        let rows = list["rows"].as_array().cloned().unwrap_or_default();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0]["text"].as_str().unwrap_or_default().contains("   2 "), "{list}");
+        assert!(rows[1]["text"].as_str().unwrap_or_default().contains("   3 "), "{list}");
+    }
+
+    #[test]
+    fn every_style_row_says_which_font_it_letters_in() {        // TypeR's library is a row per style type — Dialogue, Whisper, Shout… — and the typeface
         // behind each one used to be visible only by opening the style and reading a dropdown.
         let mut p = Panel::new();
         p.library = starter(Some("Inter"));
@@ -1267,6 +1637,11 @@ mod tests {
                     | "ed_spaceAfter"
                     | "ed_colorHex"
                     | "ed_antiAlias"
+                    | "scriptLine"
+                    // The panes' ids name the host's scroll state, not a control: nothing is sent
+                    // when one is scrolled.
+                    | "scriptPane"
+                    | "stylesPane"
             ) || prefix("s", "_apply")
                 || prefix("s", "_edit")
                 || prefix("f", "_edit")
@@ -1284,9 +1659,11 @@ mod tests {
             if let Some(id) = v.get("id").and_then(Value::as_str) {
                 out.push(id.to_string());
             }
-            if let Some(children) = v.get("children").and_then(Value::as_array) {
-                for c in children {
-                    ids(c, out);
+            for key in ["children", "footer"] {
+                if let Some(list) = v.get(key).and_then(Value::as_array) {
+                    for c in list {
+                        ids(c, out);
+                    }
                 }
             }
         }

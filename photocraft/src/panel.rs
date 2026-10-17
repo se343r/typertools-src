@@ -228,6 +228,10 @@ pub struct Panel {
     /// are re-fonted the moment the family list arrives, because the font a starter library is built
     /// on is a guess about the machine — and a guess that Tahoma exists is a bad one on Linux.
     starter_pending: bool,
+    /// The widget features this host draws, from `init.host.widgets` (`list`, `scroll`,
+    /// `label.color`, `label.font`, `button.icon`). Empty on a host that sends none, which is how
+    /// one module serves both: the view asks [`Panel::has`] and sends the plain layout otherwise.
+    pub widgets: Vec<String>,
 }
 
 impl Default for Panel {
@@ -269,7 +273,22 @@ impl Panel {
             seq: 0,
             runs: 0,
             starter_pending: false,
+            widgets: Vec::new(),
         }
+    }
+
+    /// Whether this host draws a widget feature (`init.host.widgets`). A feature the host never
+    /// named is absent, so the module falls back rather than relying on a tree the host refuses.
+    pub fn has(&self, feature: &str) -> bool {
+        self.widgets.iter().any(|w| w == feature)
+    }
+
+    /// The raw script rows the script list draws, in order: every row, or — with finished rows
+    /// hidden — only the rows still to letter. Capped at what a `list` widget may hold; the rows
+    /// past it stay in the script box and are reachable there.
+    pub fn list_rows(&self) -> Vec<usize> {
+        let visible = (0..self.lines.len()).filter(|i| !(self.hide_done && self.done.contains(i)));
+        visible.take(view::LIST_MAX).collect()
     }
 
     /// The document's resolution, or 72 dpi when there is no document: every point/pixel conversion
@@ -377,7 +396,9 @@ impl Panel {
                 self.reply(Vec::new())
             }
             "ui.change" => self.change(text(event, "id").as_str(), &value(event, "value"), now(event)),
-            "ui.click" => self.click(text(event, "id").as_str(), now(event)),
+            // A click carries a value only where the widget has one to report — a `list` row's
+            // index. Everything else sends `null`, which the handler ignores.
+            "ui.click" => self.click(text(event, "id").as_str(), &value(event, "value"), now(event)),
             "result" => self.result(event),
             "cancel" => {
                 self.run = None;
@@ -437,6 +458,15 @@ impl Panel {
                 let name = name.trim();
                 if !name.is_empty() && name.chars().count() <= view::LABEL_MAX {
                     self.states.insert(name.to_string(), SavedState::from_json(saved));
+                }
+            }
+        }
+        self.widgets.clear();
+        if let Some(list) = event.get("host").and_then(|h| h.get("widgets")).and_then(Value::as_array) {
+            for w in list.iter().filter_map(Value::as_str).take(32) {
+                let w = w.trim();
+                if !w.is_empty() && w.len() <= 64 && !self.widgets.iter().any(|x| x == w) {
+                    self.widgets.push(w.to_string());
                 }
             }
         }
@@ -848,7 +878,18 @@ impl Panel {
         e.edited = at;
     }
 
-    fn click(&mut self, id: &str, at: u64) -> Vec<Value> {
+    fn click(&mut self, id: &str, value: &Value, at: u64) -> Vec<Value> {
+        // A row of the script list: the host sends its index among the rows it drew, and
+        // `list_rows` is the same list the view built, so the mapping back to a raw script row is
+        // exact — including while finished rows are hidden.
+        if id == "scriptLine" {
+            if let Some(i) = value.as_u64().and_then(|n| usize::try_from(n).ok())
+                && let Some(raw) = self.list_rows().get(i).copied()
+            {
+                self.cursor = raw;
+            }
+            return self.reply(Vec::new());
+        }
         // Library rows first: their ids carry an index.
         if let Some(i) = row_index(id, "s", "_apply") {
             let index = self.library.styles.len();
@@ -1628,6 +1669,11 @@ mod tests {
             self.send(json!({"type": "ui.click", "now": 5, "id": id}))
         }
 
+        /// A click on a `list` row: the host sends the row's index as the event's value.
+        fn click_row(&mut self, id: &str, row: usize) -> &mut H {
+            self.send(json!({"type": "ui.click", "now": 5, "id": id, "value": row}))
+        }
+
         fn change(&mut self, id: &str, value: Value) -> &mut H {
             self.send(json!({"type": "ui.change", "now": 5, "id": id, "value": value}))
         }
@@ -2127,6 +2173,59 @@ mod tests {
         assert_eq!(h.p.cursor, 4, "a line that is not there leaves the cursor alone");
         h.change("lineNo", json!(0));
         assert_eq!(h.p.cursor, 4, "and dialogue numbers start at one");
+    }
+
+    #[test]
+    fn the_host_says_which_widgets_it_draws_and_the_view_uses_them() {
+        let mut h = H { p: Panel::new(), out: Vec::new() };
+        h.send(json!({"type": "init", "now": 10, "storage": {},
+                      "host": {"name": "PhotoCraft", "widgets": ["list", "scroll", "scroll", "", 7, "label.color"]}}));
+        assert!(h.p.has("list") && h.p.has("scroll") && h.p.has("label.color"));
+        assert!(!h.p.has("button.icon"), "a feature the host did not name is absent");
+        assert_eq!(h.p.widgets, ["list", "scroll", "label.color"], "each name once");
+        let view = h.out.iter().find(|o| o["op"] == "ui.view").map(|o| o["view"].to_string()).unwrap_or_default();
+        assert!(view.contains("\"type\":\"scroll\""), "the panes are drawn: {view}");
+        assert!(!view.contains("\"icon\":"), "but not the buttons this host cannot draw: {view}");
+
+        // A host that says nothing gets the plain page: an old module and an old host still agree.
+        let old = H::fresh();
+        assert!(old.p.widgets.is_empty());
+        let view = old.out.iter().find(|o| o["op"] == "ui.view").map(|o| o["view"].to_string()).unwrap_or_default();
+        assert!(!view.contains("\"type\":\"list\""), "{view}");
+        assert!(!view.contains("\"type\":\"scroll\""), "{view}");
+    }
+
+    #[test]
+    fn clicking_a_script_row_works_on_that_line() {
+        let mut h = H::fresh();
+        h.p.widgets = ["list", "scroll", "label.color", "label.font", "button.icon"].iter().map(|s| s.to_string()).collect();
+        h.p.library = library::starter(None);
+        h.p.script = "d. one\nd. two\n## a note\nd. three".into();
+        h.p.reparse();
+        h.click_row("scriptLine", 2);
+        assert_eq!(h.p.cursor, 2, "the row index is the script row");
+        assert!(h.out.iter().any(|o| o["op"] == "ui.view" && o["view"].to_string().contains("\"selected\":2")), "and the view says so");
+        // A row that is not drawn leaves the line where it is, and a click with no value is a
+        // press the host did not give an index for — neither is an error.
+        h.click_row("scriptLine", 99);
+        assert_eq!(h.p.cursor, 2);
+        h.click("scriptLine");
+        assert_eq!(h.p.cursor, 2);
+    }
+
+    #[test]
+    fn a_hidden_finished_row_does_not_shift_the_row_a_click_names() {
+        // TypeR hides the rows it has lettered. The list then draws the remaining rows, and the
+        // click's index is among *those*: mapping it as a raw row would letter the wrong line.
+        let mut h = H::fresh();
+        h.p.library = library::starter(None);
+        h.p.script = "d. one\nd. two\nd. three\nd. four".into();
+        h.p.reparse();
+        h.p.hide_done = true;
+        h.p.done.insert(0);
+        h.p.done.insert(2);
+        h.click_row("scriptLine", 1);
+        assert_eq!(h.p.cursor, 3, "the second drawn row is the fourth script row");
     }
 
     #[test]
