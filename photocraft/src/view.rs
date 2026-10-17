@@ -53,6 +53,13 @@ pub fn separator() -> Value {
     json!({"type": "separator"})
 }
 
+/// A collapsible group. The host remembers whether it is open by its title, so a title is part of
+/// the widget's identity: "Done (3)" becoming "Done (4)" would reopen a section the letterer had
+/// closed. Callers keep the title stable for that reason.
+pub fn section(title: &str, collapsed: bool, children: Vec<Value>) -> Value {
+    json!({"type": "section", "title": cut(title), "collapsed": collapsed, "children": children})
+}
+
 /// Plain text. Anything over the host's label limit is cut: a style's name is whatever the library
 /// says, and one long name must not cost the letterer their panel.
 pub fn label(text: impl AsRef<str>) -> Value {
@@ -290,12 +297,51 @@ fn busy(p: &Panel) -> bool {
     p.run.is_some()
 }
 
-fn page_title(p: &Panel) -> Value {
-    let dialogue = script::count(&p.lines);
-    match dialogue {
-        0 => muted("The script is empty: paste one line of dialogue per row."),
-        n => muted(format!("{n} line(s) of dialogue · line {} of {n}", p.line_number())),
+/// The top of the panel: where the work is, the line it is on, and a window of the lines around it.
+/// This is the first thing in the panel, so a letterer opens it and sees the line they are on without
+/// scrolling — the rest of the preview pane is what they press to act on it.
+fn top(p: &Panel) -> Vec<Value> {
+    let rows = p.lines.len();
+    let counter = if rows == 0 {
+        muted("Line 0 / 0")
+    } else {
+        label(format!("Line {} / {}", p.cursor.min(rows - 1) + 1, rows))
+    };
+    vec![counter, line_preview(p), context(p)]
+}
+
+/// Characters of dialogue a row in [`context`] shows. Six rows of this, a line number and a marker
+/// each stay inside the host's 256-character label with room to spare.
+pub const CONTEXT_CHARS: usize = 30;
+
+/// The lines around the current one, as **one** multi-line label: two rows before it, the row itself
+/// marked `▶`, and three after, each with its raw line number. A finished row is marked `✓`.
+///
+/// ABI v2 has no monospace level, so this is a proportional label: the numbers are right-aligned in
+/// four columns, which keeps the rows readable in a proportional face, and each row's dialogue is cut
+/// so the whole block fits one label (a label over 256 characters makes the host refuse the view).
+fn context(p: &Panel) -> Value {
+    if p.lines.is_empty() {
+        return muted("The script is empty: paste one line of dialogue per row.");
     }
+    let from = p.cursor.saturating_sub(2);
+    let to = (p.cursor.saturating_add(4)).min(p.lines.len());
+    let rows: Vec<String> = (from..to)
+        .filter_map(|i| {
+            let line = p.lines.get(i)?;
+            let marker = if i == p.cursor {
+                "▶"
+            } else if p.done.contains(&i) {
+                "✓"
+            } else {
+                " "
+            };
+            let text = if line.text.trim().is_empty() { "(no text)" } else { line.text.as_str() };
+            let text = cut_to(text, CONTEXT_CHARS).replace('\n', " ");
+            Some(format!("{marker}{:>4} {text}", i + 1))
+        })
+        .collect();
+    label(rows.join("\n"))
 }
 
 // --- Lettering ---------------------------------------------------------------------------------
@@ -307,6 +353,7 @@ fn lettering(p: &Panel) -> Vec<Value> {
     let mut out = preview_pane(p);
     out.push(separator());
     out.extend(script_pane(p));
+    out.extend(done_section(p));
     out.push(separator());
     out.extend(styles(p));
     out.push(separator());
@@ -314,12 +361,11 @@ fn lettering(p: &Panel) -> Vec<Value> {
     out
 }
 
-/// The preview pane: the current line, its style, the scale, the actions and the size steps.
+/// The preview pane: the current line and its neighbours, the scale, the actions and the size steps.
 fn preview_pane(p: &Panel) -> Vec<Value> {
     let working = busy(p);
-    let mut out = vec![
-        page_title(p),
-        line_preview(p),
+    let mut out = top(p);
+    out.extend([
         row(vec![
             label("Line"),
             number("lineNo", p.line_number() as f64, 1.0, script::count(&p.lines).max(1) as f64, 1.0, false),
@@ -343,7 +389,7 @@ fn preview_pane(p: &Panel) -> Vec<Value> {
             "A−/A+ step the type by {} pt and keep the layer where it is. Apply puts the current style on the selected layers without touching what they say.",
             p.size_increment
         )),
-    ];
+    ]);
     if working {
         out.push(progress());
         out.push(muted("Working…"));
@@ -353,10 +399,42 @@ fn preview_pane(p: &Panel) -> Vec<Value> {
 
 /// The script pane: the field, and the line the preview pane is on.
 fn script_pane(p: &Panel) -> Vec<Value> {
+    let hidden = p.hide_done && !p.done.is_empty();
+    let hint = if hidden { format!("{} finished row(s) hidden", p.done.len()) } else { "one line of dialogue per row".to_string() };
     vec![
-        row(vec![label("Script"), muted("one line of dialogue per row")]),
-        text("script", &clip(&p.script), "One line of dialogue per row. Start a line with a style's prefix to set it in that style.", true, SCRIPT_MAX),
+        row(vec![label("Script"), muted(hint)]),
+        text(
+            "script",
+            &clip(&p.visible_script()),
+            "One line of dialogue per row. Start a line with a style's prefix to set it in that style.",
+            true,
+            SCRIPT_MAX,
+        ),
     ]
+}
+
+/// The finished rows: a collapsed section with the option to leave them out of the script box, and
+/// what has been lettered so far. The title stays `Done` — the host remembers a section's open state
+/// by its title, so a count in the title would reopen a section that was closed.
+fn done_section(p: &Panel) -> Vec<Value> {
+    let count = p.done.len();
+    let mut children = vec![
+        toggle("hideDone", p.hide_done, "Hide finished lines from the script box"),
+        muted(if count == 0 {
+            "No rows finished yet: Create and Insert mark the row they letter.".to_string()
+        } else {
+            format!("{count} finished row(s). Marked ✓ in the script above; clicking a row's line number or moving with ◀ ▶ works as before.")
+        }),
+    ];
+    for i in p.done.iter().copied().take(MAX_ROWS) {
+        let Some(line) = p.lines.get(i) else { continue };
+        let text = if line.text.trim().is_empty() { "(no text)" } else { line.text.as_str() };
+        children.push(muted(format!("{:>4}. {}", i + 1, cut_to(text, LABEL_MAX.saturating_sub(12)))));
+    }
+    if count > MAX_ROWS {
+        children.push(muted(format!("{} more finished row(s) not listed here.", count - MAX_ROWS)));
+    }
+    vec![section("Done", true, children)]
 }
 
 /// The line the buttons will letter with: its style, and the text as the script has it.
@@ -978,6 +1056,7 @@ mod tests {
                 id,
                 "page"
                     | "script"
+                    | "hideDone"
                     | "lineNo"
                     | "textScale"
                     | "defaultStyle"
@@ -1136,13 +1215,97 @@ mod tests {
         let dumped = render(&p).to_string();
         assert!(dumped.contains("Sound effect"), "{dumped}");
         assert!(dumped.contains("BANG"), "{dumped}");
-        assert!(dumped.contains("line 1 of 1"), "{dumped}");
+        assert!(dumped.contains("Line 1 / 1"), "{dumped}");
         // An ignored line says why the buttons skip it.
         p.script = "## a door".into();
         p.reparse();
         let dumped = render(&p).to_string();
         assert!(dumped.contains("ignore prefix"), "{dumped}");
     }
+
+    /// The text of the first label with more than one line in it: the panel's context window is the
+    /// only widget that draws several rows in one label.
+    fn multi_line_label(v: &Value) -> Option<String> {
+        if v.get("type").and_then(Value::as_str) == Some("label")
+            && let Some(t) = v.get("text").and_then(Value::as_str)
+            && t.contains('\n')
+        {
+            return Some(t.to_string());
+        }
+        v.get("children").and_then(Value::as_array).into_iter().flatten().find_map(multi_line_label)
+    }
+
+    /// The value of the `text` widget with this id.
+    fn text_value(v: &Value, wanted: &str) -> Option<String> {
+        if v.get("type").and_then(Value::as_str) == Some("text") && v.get("id").and_then(Value::as_str) == Some(wanted) {
+            return v.get("value").and_then(Value::as_str).map(str::to_string);
+        }
+        v.get("children").and_then(Value::as_array).into_iter().flatten().find_map(|c| text_value(c, wanted))
+    }
+
+    #[test]
+    fn the_top_of_the_panel_is_the_line_and_a_window_of_the_lines_around_it() {
+        let mut p = Panel::new();
+        p.library = starter(None);
+        p.script = "d. one\nd. two\nd. three\nd. four\nd. five\nd. six\nd. seven".into();
+        p.reparse();
+        p.cursor = 3;
+        p.done.insert(2); // a finished row inside the window
+        let view = render(&p);
+        check(&view);
+        let dumped = view.to_string();
+        assert!(dumped.contains("Line 4 / 7"), "the counter is where the work is: {dumped}");
+        let block = multi_line_label(&view).expect("the context window is one multi-line label");
+        assert!(block.contains("▶   4 four"), "the current row is marked: {block}");
+        assert!(block.contains("✓   3 three"), "a finished row is marked: {block}");
+        assert!(block.contains("two") && block.contains("six"), "two rows before and three after: {block}");
+        assert!(!block.contains("one"), "and no further back: {block}");
+        assert!(block.contains("seven"), "the third row after the current one: {block}");
+        assert_eq!(block.lines().count(), 6);
+    }
+
+    #[test]
+    fn the_context_label_fits_what_the_host_will_draw() {
+        // A label over 256 characters makes the host refuse the whole view, and a script row can be
+        // as long as the script itself.
+        let long = format!("d. {}", "x".repeat(SCRIPT_MAX - 3));
+        let mut p = Panel::new();
+        p.library = starter(None);
+        p.script = [long.as_str(); 8].join("\n");
+        p.reparse();
+        p.cursor = 4;
+        let view = render(&p);
+        check(&view);
+        let block = multi_line_label(&view).expect("the context window is one multi-line label");
+        assert!(block.chars().count() <= LABEL_MAX, "{} characters", block.chars().count());
+    }
+
+    #[test]
+    fn finished_rows_can_be_left_out_of_the_script_box_and_are_listed_under_done() {
+        let mut p = Panel::new();
+        p.library = starter(None);
+        p.script = "d. one\nd. two\nd. three".into();
+        p.reparse();
+        p.done.insert(0);
+        let view = render(&p);
+        check(&view);
+        assert_eq!(text_value(&view, "script").as_deref(), Some("d. one\nd. two\nd. three"), "visible until the letterer asks");
+
+        p.hide_done = true;
+        let view = render(&p);
+        check(&view);
+        assert_eq!(text_value(&view, "script").as_deref(), Some("d. two\nd. three"), "the finished row is left out");
+        let dumped = view.to_string();
+        assert!(dumped.contains("\"title\":\"Done\""), "{dumped}");
+        assert!(dumped.contains("1 finished row(s)"), "{dumped}");
+        // The title is stable: the host remembers whether a section is open by its title, so a count
+        // in the title would reopen it every time a row was lettered.
+        p.done.insert(1);
+        let dumped = render(&p).to_string();
+        assert!(dumped.contains("\"title\":\"Done\""), "{dumped}");
+        assert!(!dumped.contains("\"title\":\"Done (2)\""), "{dumped}");
+    }
+
 
     #[test]
     fn a_huge_script_is_clipped_to_what_a_widget_may_hold() {

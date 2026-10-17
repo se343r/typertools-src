@@ -21,7 +21,7 @@
 //!   selection, a raster layer selected, a script that is empty. Every one of those is a message in
 //!   the footer, never a failed reply.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::{Value, json};
 
@@ -37,6 +37,10 @@ use crate::view;
 pub const STORAGE_LIBRARY: &str = "library";
 pub const STORAGE_SETTINGS: &str = "settings";
 pub const STORAGE_SCRIPT: &str = "script";
+/// The script rows already lettered, and whether the script box hides them. Its own key rather than
+/// part of `script`: `script` has always been a plain string, and an older panel's storage must keep
+/// loading unchanged.
+pub const STORAGE_DONE: &str = "done";
 pub const STORAGE_STATES: &str = "states";
 
 /// One named snapshot of the working position, TypeR's "states" (`settings.jsx` › Data): the script,
@@ -192,6 +196,11 @@ pub struct Panel {
     pub lines: Vec<Line>,
     /// Which line the buttons work on: an index into `lines`, which is the raw script row.
     pub cursor: usize,
+    /// The raw script rows that have been lettered: Create and Insert add the row they set. An index
+    /// into `lines`; emptied whenever the script itself is edited, because rows move then.
+    pub done: BTreeSet<usize>,
+    /// Whether the script box leaves the finished rows out (the Done section lists them).
+    pub hide_done: bool,
     pub doc: Option<Doc>,
     pub fonts: Fonts,
     pub edit: Option<Edit>,
@@ -245,6 +254,8 @@ impl Panel {
             script: String::new(),
             lines: Vec::new(),
             cursor: 0,
+            done: BTreeSet::new(),
+            hide_done: false,
             doc: None,
             fonts: Fonts::default(),
             edit: None,
@@ -291,6 +302,21 @@ impl Panel {
             Some(l) if l.number > 0 => l.number,
             _ => 1,
         }
+    }
+
+    /// The script as the script box shows it: every row, or — with finished rows hidden — only the
+    /// rows that have not been lettered yet. The hidden rows stay in [`Panel::script`]; they are
+    /// what the Done section lists and what a change made in the box is merged back around.
+    pub fn visible_script(&self) -> String {
+        if !self.hide_done || self.done.is_empty() {
+            return self.script.clone();
+        }
+        script::split(&self.script)
+            .enumerate()
+            .filter(|(i, _)| !self.done.contains(i))
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The layers an action would act on.
@@ -393,6 +419,16 @@ impl Panel {
         if let Some(s) = storage.and_then(|s| s.get(STORAGE_SCRIPT)).and_then(Value::as_str) {
             self.script = s.to_string();
         }
+        if let Some(s) = storage.and_then(|s| s.get(STORAGE_DONE)).and_then(Value::as_str)
+            && let Ok(v) = serde_json::from_str::<Value>(s)
+        {
+            self.hide_done = v.get("hide").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(list) = v.get("lines").and_then(Value::as_array) {
+                for i in list.iter().filter_map(Value::as_u64).filter_map(|i| usize::try_from(i).ok()) {
+                    self.done.insert(i);
+                }
+            }
+        }
         if let Some(s) = storage.and_then(|s| s.get(STORAGE_STATES)).and_then(Value::as_str)
             && let Ok(v) = serde_json::from_str::<Value>(s)
             && let Some(map) = v.as_object()
@@ -405,6 +441,9 @@ impl Panel {
             }
         }
         self.reparse();
+        // A stored finished-row index past the end of the script (it was shortened before it was
+        // saved, or `script` was edited elsewhere) would mark a row that does not exist.
+        self.done.retain(|i| *i < self.lines.len());
         if self.library.styles.is_empty() {
             // Nothing stored: a letterer opening the panel for the first time gets something to work
             // with rather than an empty list and a blank page. The starter library is this port's own.
@@ -546,14 +585,21 @@ impl Panel {
     /// page wants — but only for the two actions that *letter a line*. Align and the size buttons act
     /// on a layer and leave the script where it is, and TyperTools does not advance on them either
     /// (`previewBlock.jsx` sends `nextLine` from Create and Insert only).
+    ///
+    /// The line the action set is marked done first: that is what the Done section lists and what
+    /// the script box leaves out when finished rows are hidden.
     fn after_run(&mut self, kind: Option<Kind>) -> Vec<Value> {
         if !matches!(kind, Some(Kind::Create) | Some(Kind::Insert)) {
             return Vec::new();
         }
+        let mut ops = Vec::new();
+        if self.cursor < self.lines.len() && self.done.insert(self.cursor) {
+            ops.extend(self.save_done());
+        }
         if let Some(at) = script::next(&self.lines, self.cursor) {
             self.cursor = at;
         }
-        Vec::new()
+        ops
     }
 
     /// The reply: whatever else was asked for, and the panel as it now stands.
@@ -608,9 +654,36 @@ impl Panel {
                 return self.reply(self.save_settings());
             }
             "script" => {
-                self.script = as_str(value).chars().take(view::SCRIPT_MAX).collect();
+                let edited: String = as_str(value).chars().take(view::SCRIPT_MAX).collect();
+                // While finished rows are hidden, the field holds only the rows still to do: put
+                // them back where they were and leave the done rows alone. If the row count no
+                // longer matches, there is no telling where an added or removed row belongs, so the
+                // edit is refused rather than guessed at (and the view sends the field back).
+                if self.hide_done && !self.done.is_empty() {
+                    let Some(full) = merge_hidden(&self.script, &self.done, &edited) else {
+                        self.message = Some(Message::warn("Turn off Hide finished lines to add or remove rows."));
+                        return self.reply(Vec::new());
+                    };
+                    if full != self.script {
+                        self.script = full;
+                        self.reparse();
+                    }
+                    return self.reply(self.save_script());
+                }
+                if edited == self.script {
+                    return self.reply(Vec::new());
+                }
+                // Rows have probably moved: what was finished may not be finished any more.
+                self.script = edited;
+                self.done.clear();
                 self.reparse();
-                return self.reply(self.save_script());
+                let mut ops = self.save_script();
+                ops.extend(self.save_done());
+                return self.reply(ops);
+            }
+            "hideDone" => {
+                self.hide_done = on(value);
+                return self.reply(self.save_done());
             }
             "lineNo" => {
                 // The field shows the dialogue number (1-based, ignored lines unnumbered), so that is
@@ -1383,6 +1456,38 @@ impl Panel {
     fn save_script(&self) -> Vec<Value> {
         vec![json!({"op": "storage.set", "key": STORAGE_SCRIPT, "value": self.script})]
     }
+
+    fn save_done(&self) -> Vec<Value> {
+        let value = json!({
+            "lines": self.done.iter().copied().collect::<Vec<usize>>(),
+            "hide": self.hide_done,
+        })
+        .to_string();
+        vec![json!({"op": "storage.set", "key": STORAGE_DONE, "value": value})]
+    }
+}
+
+/// The full script after an edit made while the finished rows were hidden: the visible rows are
+/// taken from the field and the hidden ones are kept as they were. `None` when the number of visible
+/// rows no longer matches — an added or removed row has no place to go, and putting it somewhere
+/// could move somebody's dialogue.
+fn merge_hidden(full: &str, done: &BTreeSet<usize>, edited: &str) -> Option<String> {
+    let rows: Vec<&str> = script::split(full).collect();
+    let visible: Vec<usize> = (0..rows.len()).filter(|i| !done.contains(i)).collect();
+    let edited: Vec<&str> = script::split(edited).collect();
+    // An empty string is one empty row to `split`, but a field with nothing in it and nothing
+    // visible in it is no rows at all.
+    let edited: Vec<&str> = if edited == [""] { Vec::new() } else { edited };
+    if visible.len() != edited.len() {
+        return None;
+    }
+    let mut out: Vec<String> = rows.iter().map(|row| (*row).to_string()).collect();
+    for (at, text) in visible.into_iter().zip(edited) {
+        if let Some(row) = out.get_mut(at) {
+            *row = text.to_string();
+        }
+    }
+    Some(out.join("\n"))
 }
 
 // --- small readers -----------------------------------------------------------------------------
@@ -1716,6 +1821,46 @@ mod tests {
             h.drive();
             assert_eq!(h.p.cursor == 1, advances, "{button}: {}", h.message());
         }
+    }
+
+    #[test]
+    fn create_marks_the_line_finished_and_hiding_it_leaves_it_out_of_the_box() {
+        let mut h = H::fresh();
+        h.doc();
+        h.change("script", json!("d. one\nd. two\nd. three"));
+        h.click("create");
+        h.drive();
+        assert_eq!(h.p.cursor, 1, "the next line, as before");
+        assert_eq!(h.p.done.iter().copied().collect::<Vec<_>>(), vec![0], "the row that was lettered");
+        // The finished rows are stored under their own key, so the `script` key stays a plain string
+        // and an older panel's storage keeps loading.
+        let saved = h.find("storage.set").into_iter().find(|o| o.get("key").and_then(Value::as_str) == Some(STORAGE_DONE)).expect("the finished rows are stored");
+        assert!(saved["value"].as_str().is_some_and(|s| s.contains("\"lines\":[0]")), "{saved}");
+
+        h.change("hideDone", json!(true));
+        assert!(h.p.hide_done);
+        assert_eq!(h.p.visible_script(), "d. two\nd. three");
+        // An edit made in the shortened box goes back around the finished row rather than moving it.
+        h.change("script", json!("d. TWO\nd. THREE"));
+        assert_eq!(h.p.script, "d. one\nd. TWO\nd. THREE");
+        // A row added while rows are hidden has no place to go, so the edit is refused rather than
+        // guessed at — and the box is sent back as it was.
+        h.change("script", json!("d. TWO\nd. THREE\nd. FOUR"));
+        assert!(h.message().contains("Hide finished lines"), "{}", h.message());
+        assert_eq!(h.p.script, "d. one\nd. TWO\nd. THREE");
+    }
+
+    #[test]
+    fn the_finished_rows_survive_a_restart_and_a_stale_one_is_dropped() {
+        let mut h = H { p: Panel::new(), out: Vec::new() };
+        h.send(json!({"type": "init", "now": 10, "storage": {
+            "library": library::starter(None).to_json().to_string(),
+            "script": "d. one\nd. two",
+            "done": json!({"lines": [0, 9], "hide": true}).to_string(),
+        }}));
+        assert!(h.p.hide_done);
+        assert_eq!(h.p.done.iter().copied().collect::<Vec<_>>(), vec![0], "an index the script no longer has is dropped");
+        assert_eq!(h.p.visible_script(), "d. two");
     }
 
     #[test]
