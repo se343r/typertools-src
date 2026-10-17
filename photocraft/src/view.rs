@@ -231,17 +231,19 @@ fn faces(p: &Panel) -> Vec<(String, String)> {
 
 // --- the panel ---------------------------------------------------------------------------------
 
-/// The whole panel: the page switcher, the page, and the footer that says what happened.
+/// The whole panel. TypeR's own shape: three stacked panes — preview, script, style library — and
+/// a footer. Help, Settings and the style editor are the pages TypeR opens as modals; here they
+/// replace the panes and carry a Back button, because a panel window has no modal.
 pub fn render(p: &Panel) -> Value {
-    let mut children = vec![row(vec![muted("Panel"), page_choice(p.page)]), separator()];
-    children.extend(match p.page {
-        Page::Lettering => lettering(p),
-        Page::Styles => styles(p),
-        Page::Style => style_editor(p),
-        Page::Folders => folders(p),
-        Page::Settings => settings(p),
-        Page::Help => help(p),
-    });
+    let mut children = match p.page {
+        // `Styles` is where the panel lands after a library edit; the library is a pane of the
+        // lettering view now, so it draws the same three panes rather than a page of its own.
+        Page::Lettering | Page::Styles => lettering(p),
+        Page::Style => overlay("Style editor", style_editor(p)),
+        Page::Folders => overlay("Folders", folders(p)),
+        Page::Settings => overlay("Settings", settings(p)),
+        Page::Help => overlay("Help", help(p)),
+    };
     children.push(separator());
     children.push(status(p));
     if let Some(m) = &p.message {
@@ -254,16 +256,11 @@ pub fn render(p: &Panel) -> Value {
     column(children)
 }
 
-fn page_choice(page: Page) -> Value {
-    let options = vec![
-        ("lettering".to_string(), "Lettering".to_string()),
-        ("styles".to_string(), "Styles".to_string()),
-        ("style".to_string(), "Style editor".to_string()),
-        ("folders".to_string(), "Folders".to_string()),
-        ("settings".to_string(), "Settings".to_string()),
-        ("help".to_string(), "Help".to_string()),
-    ];
-    choice("page", page.id(), options)
+/// A page that replaces the panes (one of TypeR's modals), with the way back.
+fn overlay(title: &str, page: Vec<Value>) -> Vec<Value> {
+    let mut out = vec![row(vec![button("back", "‹ Back", false, true), label(title)]), separator()];
+    out.extend(page);
+    out
 }
 
 /// The document and the run, in one line: what the actions will act on.
@@ -303,11 +300,26 @@ fn page_title(p: &Panel) -> Value {
 
 // --- Lettering ---------------------------------------------------------------------------------
 
+/// The three panes, in TypeR's order: the preview (the line and what the buttons will do with it),
+/// the script, and the style library. A panel cannot set pane heights, so each pane is as tall as
+/// its widgets and the order is what carries the layout.
 fn lettering(p: &Panel) -> Vec<Value> {
+    let mut out = preview_pane(p);
+    out.push(separator());
+    out.extend(script_pane(p));
+    out.push(separator());
+    out.extend(styles(p));
+    out.push(separator());
+    out.push(row(vec![button("openSettings", "Settings", false, true), button("openHelp", "Help", false, true)]));
+    out
+}
+
+/// The preview pane: the current line, its style, the scale, the actions and the size steps.
+fn preview_pane(p: &Panel) -> Vec<Value> {
     let working = busy(p);
     let mut out = vec![
-        text("script", &clip(&p.script), "One line of dialogue per row. Start a line with a style's prefix to set it in that style.", true, SCRIPT_MAX),
         page_title(p),
+        line_preview(p),
         row(vec![
             label("Line"),
             number("lineNo", p.line_number() as f64, 1.0, script::count(&p.lines).max(1) as f64, 1.0, false),
@@ -316,10 +328,9 @@ fn lettering(p: &Panel) -> Vec<Value> {
             button("first", "⏮", false, !working),
             button("last", "⏭", false, !working),
         ]),
-        line_preview(p),
         separator(),
         row(vec![label("Text size"), number("textScale", p.scale, 1.0, 999.0, 1.0, true), label("%")]),
-        muted("Text size scales the style's size (and its leading) when a line is created or inserted, as TyperTools' does."),
+        muted("Text size scales the style's size (and its leading) when a line is created or inserted."),
         separator(),
         row(vec![button("create", "Create", true, !working), button("insert", "Insert", false, !working), button("align", "Align", false, !working)]),
         row(vec![
@@ -328,15 +339,24 @@ fn lettering(p: &Panel) -> Vec<Value> {
             button("apply", "Apply style", false, !working),
             button("applyKeep", "Apply, keep size", false, !working),
         ]),
-        muted(
-            "A−/A+ step the type by one document pixel and keep the layer where it is. Apply puts the current style on the selected layers without touching what they say.",
-        ),
+        muted(format!(
+            "A−/A+ step the type by {} pt and keep the layer where it is. Apply puts the current style on the selected layers without touching what they say.",
+            p.size_increment
+        )),
     ];
     if working {
         out.push(progress());
         out.push(muted("Working…"));
     }
     out
+}
+
+/// The script pane: the field, and the line the preview pane is on.
+fn script_pane(p: &Panel) -> Vec<Value> {
+    vec![
+        row(vec![label("Script"), muted("one line of dialogue per row")]),
+        text("script", &clip(&p.script), "One line of dialogue per row. Start a line with a style's prefix to set it in that style.", true, SCRIPT_MAX),
+    ]
 }
 
 /// The line the buttons will letter with: its style, and the text as the script has it.
@@ -371,14 +391,23 @@ fn styles(p: &Panel) -> Vec<Value> {
     }
     for (i, s) in p.library.styles.iter().take(MAX_ROWS).enumerate() {
         let folder = s.folder.as_ref().and_then(|f| p.library.folders.iter().find(|x| x.id == *f)).map(|f| f.name.clone());
-        let prefixes = s.prefixes_text();
+        let prefixes = s.prefixes.join(" ");
         let where_ = folder.map(|f| format!(" · {f}")).unwrap_or_default();
         let prefix = if prefixes.is_empty() { " (no prefix)".to_string() } else { format!(" [{prefixes}]") };
-        out.push(row(vec![
-            label(format!("{}{prefix}{where_}", s.name)),
-            button(&format!("s{i}_apply"), "Apply", false, !busy(p)),
-            button(&format!("s{i}_edit"), "Edit", false, !busy(p)),
-        ]));
+        let disabled = if s.prefixes_disabled { " (prefixes off)" } else { "" };
+        let mut line = vec![label(format!("{}{prefix}{where_}{disabled}", s.name))];
+        if p.quick_size {
+            // TypeR's quick style size (`stylesBlock.jsx`): a step down, the size in the style's
+            // own unit, and a step up, right on the row.
+            let size = props::char(&s.text_props, "size").and_then(Value::as_f64);
+            let step = if p.style_step.is_finite() && p.style_step > 0.0 { p.style_step } else { 0.1 };
+            line.push(button(&format!("s{i}_sizeDown"), "−", false, !busy(p)));
+            line.push(number(&format!("s{i}_size"), size.unwrap_or(14.0), 1.0, 1296.0, step, false));
+            line.push(button(&format!("s{i}_sizeUp"), "+", false, !busy(p)));
+        }
+        line.push(button(&format!("s{i}_apply"), "Apply", false, !busy(p)));
+        line.push(button(&format!("s{i}_edit"), "Edit", false, !busy(p)));
+        out.push(row(line));
     }
     if p.library.styles.len() > MAX_ROWS {
         out.push(warning(format!(
@@ -411,7 +440,7 @@ fn style_editor(p: &Panel) -> Vec<Value> {
     }
     let mut out = vec![
         row(vec![label("Name"), text("ed_name", &name, "Dialogue", false, LABEL_MAX)]),
-        row(vec![label("Prefixes"), text("ed_prefixes", &prefixes, "Words a script line may start with, space separated", false, LABEL_MAX)]),
+        row(vec![muted("Prefixes"), text("ed_prefixes", &prefixes, "One prefix per line, or separated by semicolons", true, LABEL_MAX)]),
         row(vec![muted("Prefix colour"), choice("ed_color", &color, PREFIX_COLORS.iter().map(|c| (c.to_string(), c.to_string())).collect())]),
         row(vec![muted("Folder"), choice("ed_folder", folder.as_deref().unwrap_or("-"), folder_options(p))]),
         separator(),
@@ -553,38 +582,69 @@ fn baseline_choice(p: &Panel) -> String {
     }
 }
 
+/// The folders, in the order the tree draws them, each name indented by its depth — TypeR indents
+/// the folder list in its editors by `depth * 12 + 4` pixels (`stylesBlock.jsx:140`); a text label
+/// has no padding of its own, so indentation here is two spaces a level.
 fn folder_options(p: &Panel) -> Vec<(String, String)> {
     let mut out = vec![("-".to_string(), "No folder".to_string())];
-    out.extend(p.library.folders.iter().map(|f| (f.id.clone(), f.name.clone())));
+    out.extend(p.library.folder_order().iter().filter_map(|id| p.library.folder(id)).map(|f| {
+        let indent = "  ".repeat(p.library.folder_depth(&f.id));
+        (f.id.clone(), format!("{indent}{}", f.name))
+    }));
+    out
+}
+
+/// The folders a folder can be moved into: everything except itself and its own descendants, which
+/// is the list TypeR's folder editor offers (`editFolder.jsx:147-151`).
+fn parent_options(p: &Panel) -> Vec<(String, String)> {
+    let mut out = vec![("-".to_string(), "Top level".to_string())];
+    let excluded = p.folder.as_deref().map(|id| p.library.descendants(id)).unwrap_or_default();
+    out.extend(
+        p.library
+            .folder_order()
+            .iter()
+            .filter(|id| !excluded.contains(id))
+            .filter_map(|id| p.library.folder(id))
+            .map(|f| {
+                let indent = "  ".repeat(p.library.folder_depth(&f.id));
+                (f.id.clone(), format!("{indent}{}", f.name))
+            }),
+    );
     out
 }
 
 // --- Folders -----------------------------------------------------------------------------------
 
 fn folders(p: &Panel) -> Vec<Value> {
-    let naming = p.folder.is_some();
+    let editing = p.folder.is_some();
     let mut out = vec![
-        row(vec![label("Folder"), text("f_name", &p.folder_name, "Folder name", false, LABEL_MAX), button("f_new", "New folder", naming, true)]),
+        row(vec![label("Folder"), text("f_name", &p.folder_name, "Folder name", false, LABEL_MAX), button("f_new", "New folder", editing, true)]),
+        row(vec![muted("Inside"), choice("f_parent", p.folder_parent.as_deref().unwrap_or("-"), parent_options(p))]),
         muted(
-            "Name a folder here and press New folder; or press Rename to load a folder's own name into the field. A folder is a label on a style, not a place: putting a style in one groups it on the Styles page, and the JSON keeps TyperTools' own shape.",
+            "Folders nest, and a style belongs to one of them. With “current folder tag priority” on (Settings), a prefix in the folder of the style in use wins over the same prefix elsewhere. The arrows move a folder among its siblings. A folder's Export writes TypeR's folder file for it.",
         ),
         separator(),
     ];
     if p.library.folders.is_empty() {
         out.push(muted("No folders yet."));
     }
-    for (i, f) in p.library.folders.iter().take(MAX_ROWS).enumerate() {
+    for (i, id) in p.library.folder_order().iter().take(MAX_ROWS).enumerate() {
+        let Some(f) = p.library.folder(id) else { continue };
         let count = p.library.styles_in(Some(f.id.as_str())).len();
         let renaming_this = p.folder.as_deref() == Some(f.id.as_str());
+        let indent = "  ".repeat(p.library.folder_depth(&f.id));
         out.push(row(vec![
-            label(format!("{} ({count} style(s))", f.name)),
-            button(&format!("f{i}_edit"), if renaming_this { "Renaming" } else { "Rename" }, false, !renaming_this),
+            label(format!("{indent}{} ({count} style(s))", f.name)),
+            button(&format!("f{i}_up"), "↑", false, true),
+            button(&format!("f{i}_down"), "↓", false, true),
+            button(&format!("f{i}_edit"), if renaming_this { "Editing" } else { "Rename" }, false, !renaming_this),
+            button(&format!("f{i}_export"), "Export", false, true),
             button(&format!("f{i}_del"), "Delete", false, true),
         ]));
     }
-    if naming {
-        out.push(row(vec![button("f_save", "Save name", true, true), button("f_cancel", "Cancel", false, true)]));
-        out.push(muted("Renaming a folder leaves the styles in it alone."));
+    if editing {
+        out.push(row(vec![button("f_save", "Save", true, true), button("f_cancel", "Cancel", false, true)]));
+        out.push(muted("Saving changes the folder's name and where it sits. Its styles go with it, and deleting a folder leaves them in the unsorted list."));
     }
     if p.library.folders.len() > MAX_ROWS {
         out.push(warning(format!("{} more folders than this page draws.", p.library.folders.len() - MAX_ROWS)));
@@ -596,18 +656,53 @@ fn folders(p: &Panel) -> Vec<Value> {
 
 fn settings(p: &Panel) -> Vec<Value> {
     let library = &p.library;
-    vec![
+    let mut out = vec![
         toggle("set_pointText", library.point_text, "Create point text instead of a box"),
         muted(
-            "Point text is one line from a click, which is what a sound effect usually is; box text wraps inside the balloon's shape. TyperTools sets this per document too.",
+            "Point text is one line from a click, which is what a sound effect usually is; box text wraps inside the balloon's shape.",
         ),
         separator(),
-        row(vec![muted("Ignore prefixes"), text("set_ignore", &library.ignore_prefixes.join(" "), "##", false, LABEL_MAX)]),
-        muted("A script line starting with one of these is skipped by the buttons: it is a stage direction, not dialogue."),
+        row(vec![muted("Ignore prefixes"), text("set_ignore", &library.ignore_prefixes.join("\n"), "##", true, LABEL_MAX)]),
+        muted("A script line starting with one of these is skipped by the buttons: it is a stage direction, not dialogue. Separate them with line breaks or semicolons."),
+        row(vec![muted("Ignore tags"), text("set_ignoreTags", &library.ignore_tags.join("\n"), "[note]", true, LABEL_MAX)]),
+        muted("These are removed from a line wherever they appear, before the line is lettered. TypeR's default list is empty."),
+        toggle("set_folderPriority", library.folder_priority, "Prefer the prefixes of the style's own folder"),
+        muted("With this on, a line is matched against the prefixes of the folder the style in use belongs to before the library's other folders — TypeR's `currentFolderTagPriority`."),
         separator(),
-        row(vec![button("set_scaleDefault", "Text size back to 100 %", false, true), button("set_starter", "Load the starter library", false, true)]),
-        row(vec![button("set_reset", "Reset everything", false, true)]),
-    ]
+        toggle("set_markdown", p.markdown, "Interpret markdown"),
+        muted("`**bold**`, `*italic*` and `***both***` are stripped from the line and set as faux bold or italic runs. Unclosed markers stay as text."),
+        row(vec![
+            muted("Direction"),
+            choice("set_direction", &p.direction, vec![("ltr".into(), "Left to right".into()), ("rtl".into(), "Right to left".into())]),
+        ]),
+        muted("The direction every line is lettered with, as TypeR's direction setting."),
+        separator(),
+        row(vec![muted("Internal padding"), number("set_padding", p.padding, 0.0, 100.0, 1.0, false), muted("px each side of the box")]),
+        muted("TypeR's `internalPadding`: taken off both sides of the balloon box's width so the type does not touch its edge (0–100)."),
+        toggle("set_resizeOnCenter", p.resize_on_center, "Resize the text box when Align centres"),
+        muted("Off, Align only moves the layer. On, it first gives the layer the balloon's box and refits it, as TypeR's `resizeTextBoxOnCenter` does; point text is never reshaped."),
+        separator(),
+        row(vec![muted("Size step"), number("set_sizeIncrement", p.size_increment, 1.0, 99.0, 1.0, false), muted("for A−/A+")]),
+        row(vec![muted("Style size step"), number("set_styleStep", p.style_step, 0.01, 1000.0, 0.01, false)]),
+        toggle("set_quickStyleSize", p.quick_size, "Show the quick style size editor on library rows"),
+        separator(),
+        row(vec![muted("State name"), text("state_name", &p.state_name, "Scene 3", false, LABEL_MAX), button("state_save", "Save state", false, true)]),
+        muted("A state is the script, the line and the style in use — TypeR's saved states. Page images and the last opened PSD are not part of it: a panel can neither open nor see a file."),
+    ];
+    if p.states.is_empty() {
+        out.push(muted("No states saved yet."));
+    }
+    for (i, name) in p.states.keys().take(MAX_ROWS).enumerate() {
+        out.push(row(vec![
+            label(name),
+            button(&format!("st{i}_load"), "Load", false, true),
+            button(&format!("st{i}_del"), "Delete", false, true),
+        ]));
+    }
+    out.push(separator());
+    out.push(row(vec![button("set_scaleDefault", "Text size back to 100 %", false, true), button("set_starter", "Load the starter library", false, true)]));
+    out.push(row(vec![button("set_reset", "Reset everything", false, true)]));
+    out
 }
 
 // --- Help --------------------------------------------------------------------------------------
@@ -621,25 +716,26 @@ fn help(p: &Panel) -> Vec<Value> {
         separator(),
         label("What is here"),
         muted(
-            "Create, Insert, Align, the two size steps, Apply (and Apply keeping the layer's size), the style library with folders and prefixes, the style editor, the text size percentage, and the script parser with ignore prefixes.",
+            "TypeR's three panes: the preview (Create, Insert, Align, the size steps, Apply and Apply keeping the layer's size, the text size percentage), the script, and the style library. Under them: nested folders with folder-scoped prefix priority, `//` inheritance, ignore tags, markdown bold and italic, RTL direction, internal padding, resize-on-centre, both size steps, the quick style size, saved states, the style editor, and TypeR's full and single-folder JSON exports.",
         ),
         label("What is not, and why"),
         muted(
             "Keyboard shortcuts: a panel cannot add any — ABI v2 has no command or shortcut contribution, so the three actions are these buttons. Nothing is lost, but they need the panel to have focus.",
         ),
         muted("A coloured preview of a line, and the prefix colour itself: this host has no colour widget, so a prefix's colour is written out as text."),
+        muted("TypeR's draggable pane divider and script gutter: the widget set has neither a divider nor a gutter. The panes keep TypeR's order at their own content height, and the line number and style are named in the preview pane."),
         muted(
-            "Importing or exporting the library as a file: the ABI has no file dialogs, so the JSON is shown in the box below to copy out or paste in. The format is TyperTools' own, so a library moves between the two.",
+            "Importing or exporting the library as a file: the ABI has no file dialogs, so the JSON is shown in the box below to copy out or paste in. The full export is TypeR's own `TypeR_Export.json` shape; a folder's Export button writes its single-folder shape, which this port can also load.",
         ),
         muted(
             "Hanging punctuation (burasagari) is refused with a message rather than stored silently: PhotoCraft's type engine has no kinsoku line breaking yet.",
         ),
         muted(
-            "The marquee is not touched. TyperTools insets the selection by 10 px and clears it when it aligns; this port reads it and leaves it, because ABI v2 grants no selection command.",
+            "The marquee is not touched. TypeR expands and contracts the selection in twelve steps before using it; this port reads the selection, insets it by 10 px, and leaves the marquee as the letterer drew it, because ABI v2 grants no selection command. TypeR's Middle East marks option is absent for the same reason: PhotoCraft's type engine has no diacritic positioning to set.",
         ),
         separator(),
         label("The library as JSON"),
-        text("io_json", &clip(&p.io), "Paste a TyperTools library here, or press Show JSON to see this one.", true, SCRIPT_MAX),
+        text("io_json", &clip(&p.io), "Paste a TypeR library or exported folder here, or press Show JSON to see this one.", true, SCRIPT_MAX),
         row(vec![
             button("io_export", "Show JSON", false, true),
             button("io_load", "Load", false, true),
@@ -887,6 +983,21 @@ mod tests {
                     | "defaultStyle"
                     | "set_pointText"
                     | "set_ignore"
+                    | "set_ignoreTags"
+                    | "set_folderPriority"
+                    | "set_markdown"
+                    | "set_direction"
+                    | "set_padding"
+                    | "set_resizeOnCenter"
+                    | "set_sizeIncrement"
+                    | "set_styleStep"
+                    | "set_quickStyleSize"
+                    | "state_name"
+                    | "state_save"
+                    | "back"
+                    | "openSettings"
+                    | "openHelp"
+                    | "openFolders"
                     | "set_scaleDefault"
                     | "set_starter"
                     | "set_reset"
@@ -909,6 +1020,7 @@ mod tests {
                     | "ed_down"
                     | "ed_copy"
                     | "f_name"
+                    | "f_parent"
                     | "f_new"
                     | "f_save"
                     | "f_cancel"
@@ -954,6 +1066,14 @@ mod tests {
                 || prefix("s", "_edit")
                 || prefix("f", "_edit")
                 || prefix("f", "_del")
+                || prefix("f", "_up")
+                || prefix("f", "_down")
+                || prefix("f", "_export")
+                || prefix("s", "_size")
+                || prefix("s", "_sizeDown")
+                || prefix("s", "_sizeUp")
+                || prefix("st", "_load")
+                || prefix("st", "_del")
         };
         fn ids(v: &Value, out: &mut Vec<String>) {
             if let Some(id) = v.get("id").and_then(Value::as_str) {
@@ -982,13 +1102,21 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_switcher_offers_every_page_and_the_current_one() {
+    fn the_panel_is_three_panes_and_a_footer_with_no_page_tabs() {
+        // TypeR's layout: preview, then the script, then the style library. Help and Settings are
+        // buttons in the footer, and every page that replaces the panes has the way back.
         let p = Panel::new();
-        let view = render(&p);
-        let options = view["children"][0]["children"][1]["options"].as_array().cloned().unwrap_or_default();
-        assert_eq!(options.len(), 6);
-        for page in [Page::Lettering, Page::Styles, Page::Style, Page::Folders, Page::Settings, Page::Help] {
-            assert!(options.iter().any(|o| o["value"] == page.id()), "{}", page.id());
+        let dumped = render(&p).to_string();
+        assert!(dumped.contains("\"id\":\"script\""), "the script pane is drawn");
+        assert!(dumped.contains("\"id\":\"create\""), "the preview pane is drawn");
+        assert!(dumped.contains("\"id\":\"newStyle\""), "the library pane is drawn");
+        assert!(dumped.contains("\"id\":\"openSettings\"") && dumped.contains("\"id\":\"openHelp\""));
+        assert!(!dumped.contains("\"id\":\"page\""), "no page switcher: the panes are the panel");
+        for page in [Page::Style, Page::Folders, Page::Settings, Page::Help] {
+            let mut p = Panel::new();
+            p.page = page;
+            let dumped = render(&p).to_string();
+            assert!(dumped.contains("\"id\":\"back\""), "{:?} has a Back button: {dumped}", page);
         }
     }
 

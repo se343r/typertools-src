@@ -12,8 +12,11 @@
 //! means by "insert this line" — one thing to undo.
 //!
 //! The geometry itself is in [`crate::geom`]; what is here is the order the calls go in, which is
-//! the part that has to match TyperTools 1.4.9 (`app_src/src/host.js`). Two details are the reason
-//! the box exists at all:
+//! the part that has to match TypeR 2.5.0 (`app_src/src/host.js`, `typer.jsx`). The sequences are
+//! TyperTools 1.4.9's with TypeR's additions: Align leaves the box alone and only moves the layer
+//! when `resizeTextBoxOnCenter` is off, and a markdown script applies its character runs in a
+//! follow-up `type.edit` after the text is measured, because `type.create` takes no run list. Two
+//! details are the reason the box exists at all:
 //!
 //! * a new block of type is given a box **fifteen times** taller than the balloon before the text is
 //!   laid out in it, so the line does not wrap; afterwards the box is refitted around the measured
@@ -23,10 +26,11 @@
 //!   way — which is why the port does not need TyperTools' "create as a box, then convert to point"
 //!   dance.
 //!
-//! Nothing here touches the marquee. TyperTools contracts the selection by changing it and, on
-//! Align, deselects at the end; the engine has no command a panel may run to put a selection back,
-//! so the port reads the marquee and leaves it alone. That is a divergence, it is deliberate, and
-//! it is the one a letterer will notice — their marquee survives an action.
+//! Nothing here touches the marquee. TyperTools and TypeR contract the selection by changing it
+//! and, on Align, deselect at the end; the engine has no command a panel may run to put a selection
+//! back, so the port reads the marquee, insets it by TypeR's `internalPadding` when measuring, and
+//! leaves it alone. That is a divergence, it is deliberate, and it is the one a letterer will
+//! notice — their marquee survives an action.
 
 use std::collections::VecDeque;
 
@@ -90,7 +94,9 @@ const INFO: u8 = 2;
 const BOX: u8 = 3;
 const STYLE: u8 = 4;
 const FIT: u8 = 5;
-const END: u8 = 6;
+/// Character runs laid over text that is already in the layer (markdown's bold and italic).
+const RUNS: u8 = 6;
+const END: u8 = 7;
 
 /// One action, in flight.
 #[derive(Clone, Debug)]
@@ -108,6 +114,14 @@ pub struct Run {
     pub antialias: String,
     /// The size step, in points (Resize).
     pub delta: f64,
+    /// Character runs to apply once the text is in the layer, as markdown's weights are. Empty
+    /// unless the script's markdown setting is on and the line carries a marker.
+    pub runs: Vec<Value>,
+    /// TypeR's `resizeTextBoxOnCenter`: whether Align gives the layer the balloon's box as well as
+    /// centring it, or only centres the layer it has.
+    pub resize: bool,
+    /// TypeR's `internalPadding`, in document pixels: taken off both sides of a new box's width.
+    pub padding: f64,
     /// Keep each layer's own size when a style is applied (TyperTools' Ctrl+click).
     pub keep_size: bool,
     /// Make point text rather than paragraph text (TyperTools' "paste as point text" setting). Only
@@ -154,6 +168,9 @@ impl Run {
             params: json!({}),
             antialias: "smooth".into(),
             delta: 0.0,
+            runs: Vec::new(),
+            resize: false,
+            padding: 0.0,
             keep_size: false,
             point: false,
             todo,
@@ -202,7 +219,7 @@ impl Run {
                 self.layer = Some(id);
                 self.warnings =
                     v.get("warnings").and_then(Value::as_array).map(|w| w.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
-                self.phase = INFO;
+                self.phase = if self.runs.is_empty() { INFO } else { RUNS };
             }
             // A layer measured: what the fit needs, and which steps this layer has at all.
             INFO => {
@@ -227,9 +244,10 @@ impl Run {
                 self.phase = match self.kind {
                     // Create's box came from the layer it made; there is nothing left but the fit.
                     Kind::Create => FIT,
-                    // Align gives the layer the balloon's box, whatever box it had before — but
-                    // point text has no box, so all that is left for it is the move.
-                    Kind::Align if !point => BOX,
+                    // Align gives the layer the balloon's box when TypeR's resize-on-centre is on,
+                    // whatever box it had before — but point text has no box, and with the setting
+                    // off Align leaves the box alone and only moves the layer.
+                    Kind::Align if !point && self.resize => BOX,
                     Kind::Align => FIT,
                     // A style cannot be applied to a point layer's box: it has none.
                     Kind::Apply if point || !boxed => STYLE,
@@ -243,9 +261,14 @@ impl Run {
             BOX => {
                 self.last = Some(Measured::of(v));
                 self.phase = match self.kind {
+                    Kind::Insert if !self.runs.is_empty() => RUNS,
                     Kind::Insert | Kind::Apply => STYLE,
                     _ => FIT,
                 };
+            }
+            RUNS => {
+                self.last = Some(Measured::of(v));
+                self.phase = if self.kind == Kind::Create { INFO } else { STYLE };
             }
             STYLE => {
                 self.last = Some(Measured::of(v));
@@ -305,7 +328,7 @@ impl Run {
                 } else {
                     // Paragraph text: far too tall on purpose, so the line does not wrap before
                     // there is a box to fit it to.
-                    let rect = sel.box_for();
+                    let rect = sel.box_for(self.padding);
                     self.box_set = Some(rect);
                     o.insert("box".into(), json!(rect.as_box()));
                 }
@@ -335,7 +358,7 @@ impl Run {
                     let Some(sel) = self.sel else {
                         return Step::Failed("there is no selection to align to".into());
                     };
-                    let rect = sel.box_for();
+                    let rect = sel.box_for(self.padding);
                     self.box_set = Some(rect);
                     self.call("type.edit", json!({"layer": self.layer, "box": rect.as_box(), "coalesce": self.coalesce}))
                 }
@@ -367,6 +390,7 @@ impl Run {
                 }
                 self.call("type.setStyle", params)
             }
+            RUNS => self.call("type.edit", json!({"layer": self.layer, "runs": self.runs, "coalesce": self.coalesce})),
             FIT => {
                 let Some(m) = self.last.as_ref() else {
                     return Step::Failed("the host did not measure the layer".into());
@@ -654,6 +678,7 @@ mod tests {
     #[test]
     fn align_shapes_each_layer_to_the_balloon_and_centres_it() {
         let mut r = Run::begin(Kind::Align, "tt3".into(), vec![4, 5]);
+        r.resize = true;
         assert_eq!(r.step(DPI, None), Step::Doc);
         let (command, params) = call(r.step(DPI, Some(&doc_answer())));
         assert_eq!((command, params["layer"].clone()), ("type.info", json!(4)));
@@ -682,9 +707,24 @@ mod tests {
     }
 
     #[test]
+    fn align_with_resize_off_moves_the_layer_without_touching_its_box() {
+        // TypeR's `resizeTextBoxOnCenter` defaults off: Align is then a centring move and nothing
+        // else — the box the letterer set in Photoshop stays exactly as it was.
+        let mut r = Run::begin(Kind::Align, "tt3b".into(), vec![4]);
+        assert_eq!(r.step(DPI, None), Step::Doc);
+        let (command, _) = call(r.step(DPI, Some(&doc_answer())));
+        assert_eq!(command, "type.info");
+        let before = info("hi", [0.0, 0.0, 40.0, 20.0], 14.0, Some([0.0, 0.0, 100.0, 20.0]));
+        let (command, params) = call(r.step(DPI, Some(&before)));
+        assert_eq!(command, "type.edit");
+        assert!(params.get("box").is_none(), "the box is not resized: {}", params);
+        assert_eq!(params["move"], json!([180.0, 120.0]));
+    }
+
+    #[test]
     fn resize_grows_the_box_with_the_type_and_keeps_the_line_where_it_was() {
         let mut r = Run::begin(Kind::Resize, "tt4".into(), vec![4]);
-        r.delta = geom::size_step_pt(DPI); // one document pixel: 0.24 pt at 300 dpi
+        r.delta = 0.24; // one document pixel: 0.24 pt at 300 dpi
 
         let before = info("I'll be home by six.", [300.0, 400.0, 500.0, 430.0], 14.0, Some([300.0, 400.0, 200.0, 30.0]));
         assert!(matches!(r.step(DPI, None), Step::Call { command: "type.info", .. }));
@@ -717,7 +757,7 @@ mod tests {
     #[test]
     fn shrinking_point_text_leaves_its_shape_alone() {
         let mut r = Run::begin(Kind::Resize, "tt5".into(), vec![4]);
-        r.delta = -geom::size_step_pt(DPI);
+        r.delta = -0.24;
         let before = info("shout", [0.0, 0.0, 100.0, 40.0], 20.0, None);
         assert!(matches!(r.step(DPI, None), Step::Call { command: "type.info", .. }));
         let (command, params) = call(r.step(DPI, Some(&before)));
@@ -733,7 +773,7 @@ mod tests {
     #[test]
     fn a_size_that_cannot_move_any_further_says_so() {
         let mut r = Run::begin(Kind::Resize, "tt6".into(), vec![4]);
-        r.delta = geom::size_step_pt(DPI);
+        r.delta = 0.24;
         assert!(matches!(r.step(DPI, None), Step::Call { command: "type.info", .. }));
         match r.step(DPI, Some(&info("x", [0.0, 0.0, 1.0, 1.0], geom::MAX_SIZE_PT, None))) {
             Step::Failed(why) => assert!(why.contains("already at 1296.0 pt"), "{why}"),

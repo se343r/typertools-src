@@ -1,10 +1,12 @@
 //! The lettering geometry, and the unit conversions under it.
 //!
-//! Every number here is a behaviour of **TyperTools 1.4.9** (a Photoshop CEP panel, MIT, © 2017
-//! Swirt) read off its published source: how it turns a marquee drawn around a balloon into a text
-//! box, how it nudges the type size, and how it keeps a block of type where it was. This is a port,
-//! so the constants are taken from that source rather than guessed, and each one has a test, because
-//! this is the part a letterer notices drifting.
+//! Every number here is a behaviour of **TypeR 2.5.0** (a Photoshop CEP panel, MIT) read off its
+//! published source, with the constants it kept from **TyperTools 1.4.9** (MIT, © 2017 Swirt): how
+//! it turns a marquee drawn around a balloon into a text box, how its `internalPadding` narrows that
+//! box, how it nudges the type size (TypeR replaced TyperTools' fixed step with the layer's own
+//! `textSizeIncrement` and the style library's `styleSizeStep`), and how it keeps a block of type
+//! where it was. This is a port, so the constants are taken from that source rather than guessed,
+//! and each one has a test, because this is the part a letterer notices drifting.
 //!
 //! One model difference is worth stating up front. Photoshop stores a layer's type size in the
 //! layer's own ruler unit, and TyperTools' default is pixels, so a size of `14` there is 14 device
@@ -16,7 +18,8 @@
 /// How much the marquee is pulled in before it is used, in document pixels.
 ///
 /// TyperTools contracts the selection by 10 px and then measures it, so the balloon's outline (and
-/// the marquee's own soft edge) does not decide the text box.
+/// the marquee's own soft edge) does not decide the text box. TypeR keeps this as the default of
+/// its `internalPadding` setting; the port applies the setting instead of changing the marquee.
 pub const SELECTION_CONTRACT_PX: f64 = 10.0;
 
 /// A selection smaller than this is not a balloon, in square pixels.
@@ -25,6 +28,14 @@ pub const MIN_SELECTION_AREA: f64 = 200.0;
 /// A new text box takes this much of the (contracted) selection's width.
 pub const BOX_WIDTH_FACTOR: f64 = 0.9;
 
+/// TypeR's `internalPadding` default, in document pixels (`context.jsx:150`): after the width
+/// factor, this much is taken off each side so the type does not touch the balloon's edge.
+pub const DEFAULT_INTERNAL_PADDING: f64 = 10.0;
+
+/// TypeR's narrowest text box, in document pixels (`host.js:63`): the width a padded box never goes
+/// below.
+pub const MIN_TEXTBOX_WIDTH: f64 = 10.0;
+
 /// …and this many times its height: the box is deliberately far too tall to begin with, so the text
 /// lays out on one line, and is shrunk around the result afterwards.
 pub const BOX_HEIGHT_FACTOR: f64 = 15.0;
@@ -32,10 +43,6 @@ pub const BOX_HEIGHT_FACTOR: f64 = 15.0;
 /// Growing the type grows the box with it: the bottom by this factor, the right by this one.
 pub const BOX_GROW_BOTTOM: f64 = 1.12;
 pub const BOX_GROW_RIGHT: f64 = 1.06;
-
-/// The size buttons move the type by one document pixel, expressed in points at the document's
-/// resolution.
-pub const SIZE_STEP_PX: f64 = 1.0;
 
 /// Extra room left under the last line when a box is refitted around its text, in document pixels.
 pub const BOX_PAD_PX: f64 = 2.0;
@@ -103,9 +110,15 @@ impl Rect {
         Rect { x: self.x, y: self.y, w: self.w * BOX_GROW_RIGHT, h: self.h * BOX_GROW_BOTTOM }
     }
 
-    /// The box a new block of type is given, in the contracted selection.
-    pub fn box_for(self) -> Rect {
-        Rect { x: self.x, y: self.y, w: self.w * BOX_WIDTH_FACTOR, h: self.h * BOX_HEIGHT_FACTOR }
+    /// The box a new block of type is given, in the contracted selection. `padding` is TypeR's
+    /// internal padding in document pixels: when it is positive the width loses it on both sides and
+    /// never falls below [`MIN_TEXTBOX_WIDTH`], exactly as `_calculateSelectionDimensions` does
+    /// (`host.js:498-508`). The height is this port's own deliberately-too-tall one (TypeR lays the
+    /// type out in the balloon's own height first): both are refitted around the text afterwards.
+    pub fn box_for(self, padding: f64) -> Rect {
+        let w = self.w * BOX_WIDTH_FACTOR;
+        let w = if padding > 0.0 && padding.is_finite() { (w - padding * 2.0).max(MIN_TEXTBOX_WIDTH) } else { w };
+        Rect { x: self.x, y: self.y, w, h: self.h * BOX_HEIGHT_FACTOR }
     }
 
     /// The same box, shrunk around text that laid out `content_h` pixels tall, leaving room for the
@@ -163,11 +176,6 @@ pub fn pt_to_px(pt: f64, dpi: f64) -> f64 {
     pt * dpi / 72.0
 }
 
-/// One press of a size button: one document pixel, in points.
-pub fn size_step_pt(dpi: f64) -> f64 {
-    px_to_pt(SIZE_STEP_PX, dpi)
-}
-
 /// A length in one of Photoshop's `typeUnit`s, in points. PhotoCraft's type is sized in points, so
 /// a style library written in any unit can be applied at the size its author meant.
 pub fn length_to_pt(value: f64, unit: Option<&str>, dpi: f64) -> f64 {
@@ -209,7 +217,9 @@ mod tests {
         // width — the marble-and-balloon case TyperTools was written for.
         let r = checked_selection(Some([100.0, 50.0, 200.0, 160.0])).unwrap();
         assert_eq!(r, Rect::new(110.0, 60.0, 180.0, 140.0));
-        assert_eq!(r.box_for(), Rect::new(110.0, 60.0, 162.0, 2100.0));
+        assert_eq!(r.box_for(0.0), Rect::new(110.0, 60.0, 162.0, 2100.0));
+        assert_eq!(r.box_for(10.0), Rect::new(110.0, 60.0, 142.0, 2100.0));
+        assert_eq!(r.box_for(1000.0).w, MIN_TEXTBOX_WIDTH, "the padded width never goes below 10 px");
 
         assert_eq!(checked_selection(None), Err(Refusal::NoSelection));
         // 30 × 30 contracts to 10 × 10 = 100 px², under the 200 px² floor.
@@ -240,10 +250,7 @@ mod tests {
     #[test]
     fn the_size_step_is_one_document_pixel() {
         // 72 dpi: a pixel is a point. 300 dpi: it is a quarter of one.
-        assert!((size_step_pt(72.0) - 1.0).abs() < 1e-9);
-        assert!((size_step_pt(300.0) - 0.24).abs() < 1e-9);
         // A nonsense resolution must not produce a nonsense size.
-        assert_eq!(size_step_pt(0.0), SIZE_STEP_PX);
     }
 
     #[test]

@@ -13,16 +13,16 @@ kind of port of TypeR's ancestor, [TyperTools](https://github.com/Swirt/typertoo
 
 ## Status
 
-The port is being built from TypeR 2.5.0 as its reference, and it is **not at parity yet**. What is
-committed today is the part TypeR inherits from TyperTools — the script model, the style library, the
-place/align/size geometry, the style editor — carried over from the TyperTools port and retargeted to
-its own id (`org.photocraft.typer`, so both ports can be installed side by side). TypeR's own
-features and its **three-pane layout** are the work in progress and are listed below.
+The port is built from TypeR 2.5.0 as its reference. What is here now is the workflow TypeR inherits
+from TyperTools plus **TypeR's own features that need no host change** — its three-pane layout,
+nested folders, folder-scoped prefix priority, `//` inheritance, ignore tags, markdown runs, RTL
+direction, internal padding, resize-on-centre, both size steps, the quick style size, saved states
+and both of its export shapes. It runs under its own id (`org.photocraft.typer`) so both ports can
+be installed side by side. What remains is listed below.
 
 | Where the work stands | |
 |---|---|
-| Working now | The lettering workflow: script parsing and prefixes, the style library with folders, Create / Insert / Align, size steps, applying a style, the style editor, import/export of the library JSON as text |
-| Next, no host change needed | TypeR's layout (three panes and a footer), nested folders, folder-scoped prefix priority, `//` inherit-previous-line, ignore tags, markdown runs (bold/italic), RTL direction, internal padding, resize-on-centre, size increment and style-size step, quick style size, saved states, single-folder export, TypeR's own export shape |
+| Working now | TypeR's three-pane layout and footer; script parsing with `//` inheritance and ignore tags; nested folders with folder-scoped prefix priority; Create / Insert / Align; `internalPadding` and `resizeTextBoxOnCenter`; the configurable layer size increment and style-size step; quick style size; markdown bold/italic runs; RTL direction; saved states; the style editor; import/export in TypeR's own and single-folder shapes as text |
 | Next, reused rather than rewritten | TypeR's own locale files — nine languages, MIT — carried over as data instead of being re-translated (the panel is English only until that lands) |
 | Next, needs a host allow-list row | Auto-centring without a selection (TypeR's bubble detection, on `select.magicWand`), multi-bubble mode, and the **stroke** a style carries (`layer.layerStyle.stroke`) |
 | Next, needs new host surface | Pages (a file picker and document open/close/switch, which a panel is refused today), rebindable shortcuts (a panel contributes no commands), storage on disk for the library and states |
@@ -43,8 +43,10 @@ port is waiting on:
 - a **line gutter** for the script pane — line numbers, the style prefix coloured per line, and the
   per-line insert arrow — where the `text` widget is a plain multiline field.
 
-Until they exist the panes are drawn in TypeR's order and proportions but at a fixed height, and the
-script is a plain field.
+Until they exist the panes are drawn in TypeR's order but each is as tall as its widgets, and the
+script is a plain multiline field (the line number and the style in use are named in the preview
+pane instead of a gutter). Settings, Help and the style editor are TypeR modals; a panel window has
+no modal, so they replace the panes and carry a Back button.
 
 ## What it does
 

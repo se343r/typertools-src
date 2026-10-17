@@ -9,12 +9,13 @@
 //! constants and its pane layout — with the notice in `ATTRIBUTION.md`; the two things TypeR only
 //! bundles, the GPL `lib/jam` and Adobe's `CSInterface.js`, stay out.
 //!
-//! **Status.** The port is being built from TypeR 2.5.0 as its reference. What is here today is the
-//! part shared with TyperTools 1.4.9 — the script model, the style library, the place/align/size
-//! geometry — carried over from the sibling TyperTools port and retargeted here; TypeR's own features
-//! (its three-pane layout, nested folders and folder-scoped prefix priority, markdown runs, the
-//! stroke a style carries, internal padding, saved states) are the work in progress. Anything not yet
-//! implemented says so on screen rather than behaving differently in silence.
+//! **Status.** The port is built from TypeR 2.5.0 as its reference. What is here today is the part
+//! shared with TyperTools 1.4.9 plus TypeR's own features that need no host change: its three-pane
+//! layout, nested folders and folder-scoped prefix priority, `//` inheritance, ignore tags, markdown
+//! runs, RTL direction, internal padding, resize-on-centre, both size steps, quick style size, saved
+//! states, and both export shapes. What remains — the stroke a style carries, auto-centring without a
+//! selection and multi-bubble mode — needs a host allow-list row and is named in `README.md`.
+//! Anything not implemented says so on screen rather than behaving differently in silence.
 //!
 //! The crate is two halves. `actions`, `doc`, `geom`, `library`, `props`, `script` and `view` are the
 //! plug-in itself — pure functions and a state machine, with no host access of any kind, which is why

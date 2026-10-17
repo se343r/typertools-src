@@ -21,7 +21,7 @@
 //!   selection, a raster layer selected, a script that is empty. Every one of those is a message in
 //!   the footer, never a failed reply.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 
@@ -37,6 +37,37 @@ use crate::view;
 pub const STORAGE_LIBRARY: &str = "library";
 pub const STORAGE_SETTINGS: &str = "settings";
 pub const STORAGE_SCRIPT: &str = "script";
+pub const STORAGE_STATES: &str = "states";
+
+/// One named snapshot of the working position, TypeR's "states" (`settings.jsx` › Data): the script,
+/// the line it was on and the style in use. TypeR also snapshots its page images and the last PSD it
+/// opened; a panel can neither open a file nor see one, so those two are absent rather than stored
+/// as fields that would do nothing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SavedState {
+    pub script: String,
+    /// An index into the raw script rows, as TypeR's `currentLineIndex` is.
+    pub cursor: usize,
+    pub style_id: Option<String>,
+}
+
+impl SavedState {
+    fn to_json(&self) -> Value {
+        json!({
+            "text": self.script,
+            "currentLineIndex": self.cursor,
+            "currentStyleId": self.style_id,
+        })
+    }
+
+    fn from_json(v: &Value) -> SavedState {
+        SavedState {
+            script: v.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+            cursor: v.get("currentLineIndex").and_then(Value::as_u64).unwrap_or(0).min(usize::MAX as u64) as usize,
+            style_id: v.get("currentStyleId").and_then(Value::as_str).map(str::to_string),
+        }
+    }
+}
 
 /// Which pane the panel is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +167,26 @@ pub struct Panel {
     pub library: Library,
     /// The Text Size percentage: it scales the style's size and leading on Create and Insert.
     pub scale: f64,
+    /// Interpret `**bold**`, `*italic*` and `***both***` in a line (TypeR's `interpretMarkdown`,
+    /// off by default).
+    pub markdown: bool,
+    /// `ltr` or `rtl`: the paragraph direction handed to every style a line is lettered with, as
+    /// TypeR's `direction` setting is.
+    pub direction: String,
+    /// TypeR's `internalPadding`: pixels taken off each side of the balloon box's width, 0–100.
+    pub padding: f64,
+    /// TypeR's `resizeTextBoxOnCenter`: whether Align reshapes the box, or only centres the layer.
+    pub resize_on_center: bool,
+    /// TypeR's `textSizeIncrement`: what the −/+ buttons add to a layer's size, 1–99.
+    pub size_increment: f64,
+    /// TypeR's `styleSizeStep`: what the quick style-size editor steps by, in the style's own unit.
+    pub style_step: f64,
+    /// TypeR's `showQuickStyleSize`: whether the library rows carry a size editor.
+    pub quick_size: bool,
+    /// Named snapshots, by name. TypeR keeps these in its own storage under `states`.
+    pub states: BTreeMap<String, SavedState>,
+    /// The name being typed in the states field.
+    pub state_name: String,
     pub page: Page,
     pub script: String,
     pub lines: Vec<Line>,
@@ -150,6 +201,9 @@ pub struct Panel {
     pub folder: Option<String>,
     /// What the folder name field holds.
     pub folder_name: String,
+    /// The folder the open folder editor is inside: `None` for the root of the library. Read when
+    /// naming a new folder and when saving a rename, and drawn as the editor's parent dropdown.
+    pub folder_parent: Option<String>,
     /// The JSON box on the Help page.
     pub io: String,
     pub message: Option<Message>,
@@ -178,6 +232,15 @@ impl Panel {
         Panel {
             library: Library::default(),
             scale: 100.0,
+            markdown: false,
+            direction: "ltr".to_string(),
+            padding: geom::DEFAULT_INTERNAL_PADDING,
+            resize_on_center: false,
+            size_increment: 1.0,
+            style_step: 0.1,
+            quick_size: true,
+            states: BTreeMap::new(),
+            state_name: String::new(),
             page: Page::Lettering,
             script: String::new(),
             lines: Vec::new(),
@@ -187,6 +250,7 @@ impl Panel {
             edit: None,
             folder: None,
             folder_name: String::new(),
+            folder_parent: None,
             io: String::new(),
             message: None,
             run: None,
@@ -205,8 +269,14 @@ impl Panel {
 
     /// Re-reads the script against the library's prefixes. Called whenever either changes.
     pub fn reparse(&mut self) {
-        let order = self.library.prefix_order();
-        self.lines = script::parse(&self.script, &self.library.ignore_prefixes, &order);
+        // TypeR gives priorities to the prefixes of the folder the *style in use* belongs to, so
+        // the current line's style is resolved first — and a line whose prefix changes which style
+        // is in use does not re-choose its own folder until the next parse, exactly as the original
+        // reducer reads `state.currentStyle` rather than the new state's.
+        let current_folder = self.library.current_style(self.current_line().and_then(|l| l.style_id.as_deref())).and_then(|s| s.folder.clone());
+        let prefixes = self.library.prefixes(current_folder.as_deref(), self.library.folder_priority);
+        let rules = script::Rules { ignore_prefixes: &self.library.ignore_prefixes, ignore_tags: &self.library.ignore_tags, prefixes: &prefixes };
+        self.lines = script::parse(&self.script, &rules);
         self.cursor = script::settle(&self.lines, self.cursor).unwrap_or(0);
     }
 
@@ -309,9 +379,30 @@ impl Panel {
         {
             self.scale = number(&v, "scale", 100.0).clamp(1.0, 999.0);
             self.page = Page::from_id(text(&v, "page").as_str());
+            self.markdown = v.get("markdown").and_then(Value::as_bool).unwrap_or(false);
+            self.direction = match text(&v, "direction").as_str() {
+                "rtl" => "rtl".to_string(),
+                _ => "ltr".to_string(),
+            };
+            self.padding = integer(number(&v, "internalPadding", geom::DEFAULT_INTERNAL_PADDING), 0.0, 100.0, geom::DEFAULT_INTERNAL_PADDING);
+            self.resize_on_center = v.get("resizeTextBoxOnCenter").and_then(Value::as_bool).unwrap_or(false);
+            self.size_increment = integer(number(&v, "textSizeIncrement", 1.0), 1.0, 99.0, 1.0);
+            self.style_step = positive(number(&v, "styleSizeStep", 0.1), 0.1);
+            self.quick_size = v.get("showQuickStyleSize").and_then(Value::as_bool).unwrap_or(true);
         }
         if let Some(s) = storage.and_then(|s| s.get(STORAGE_SCRIPT)).and_then(Value::as_str) {
             self.script = s.to_string();
+        }
+        if let Some(s) = storage.and_then(|s| s.get(STORAGE_STATES)).and_then(Value::as_str)
+            && let Ok(v) = serde_json::from_str::<Value>(s)
+            && let Some(map) = v.as_object()
+        {
+            for (name, saved) in map {
+                let name = name.trim();
+                if !name.is_empty() && name.chars().count() <= view::LABEL_MAX {
+                    self.states.insert(name.to_string(), SavedState::from_json(saved));
+                }
+            }
         }
         self.reparse();
         if self.library.styles.is_empty() {
@@ -497,6 +588,20 @@ impl Panel {
     // --- clicks and typed values ------------------------------------------------------------------
 
     fn change(&mut self, id: &str, value: &Value, at: u64) -> Vec<Value> {
+        // A library row's quick size editor: the field takes the style's own unit, as TypeR's does.
+        if let Some(i) = row_index(id, "s", "_size") {
+            let v = num(value);
+            if v.is_finite()
+                && v > 0.0
+                && let Some(style) = self.library.styles.get_mut(i)
+            {
+                props::set_char(&mut style.text_props, "size", json!(v));
+                props::set_char(&mut style.text_props, "impliedFontSize", json!(v));
+                style.edited = at;
+                return self.reply(self.save_library());
+            }
+            return self.reply(Vec::new());
+        }
         match id {
             "page" => {
                 self.page = Page::from_id(&as_str(value));
@@ -530,14 +635,74 @@ impl Panel {
                 return self.reply(self.save_library());
             }
             "set_ignore" => {
-                self.library.ignore_prefixes = as_str(value).split_whitespace().map(str::to_string).collect();
+                self.library.ignore_prefixes = split_tags(&as_str(value));
                 self.reparse();
                 return self.reply(self.save_library());
+            }
+            "set_ignoreTags" => {
+                self.library.ignore_tags = split_tags(&as_str(value));
+                self.reparse();
+                return self.reply(self.save_library());
+            }
+            "set_folderPriority" => {
+                self.library.folder_priority = value.as_bool().unwrap_or(true);
+                self.reparse();
+                return self.reply(self.save_library());
+            }
+            "set_markdown" => {
+                self.markdown = value.as_bool().unwrap_or(false);
+                return self.reply(self.save_settings());
+            }
+            "set_direction" => {
+                self.direction = match as_str(value).as_str() {
+                    "rtl" => "rtl".to_string(),
+                    _ => "ltr".to_string(),
+                };
+                return self.reply(self.save_settings());
+            }
+            "set_padding" => {
+                self.padding = integer(num(value), 0.0, 100.0, geom::DEFAULT_INTERNAL_PADDING);
+                return self.reply(self.save_settings());
+            }
+            "set_resizeOnCenter" => {
+                self.resize_on_center = value.as_bool().unwrap_or(false);
+                return self.reply(self.save_settings());
+            }
+            "set_sizeIncrement" => {
+                self.size_increment = integer(num(value), 1.0, 99.0, 1.0);
+                return self.reply(self.save_settings());
+            }
+            "set_styleStep" => {
+                self.style_step = positive(num(value), 0.1);
+                return self.reply(self.save_settings());
+            }
+            "set_quickStyleSize" => {
+                self.quick_size = value.as_bool().unwrap_or(true);
+                return self.reply(self.save_settings());
+            }
+            "state_name" => {
+                self.state_name = as_str(value).chars().take(view::LABEL_MAX).collect();
+                return self.reply(Vec::new());
             }
             "f_name" => {
                 // A buffer, not a folder: the field is drawn before there is a folder to name, and
                 // `f_new` and `f_save` are what write it into the library.
                 self.folder_name = as_str(value).chars().take(view::LABEL_MAX).collect();
+                return self.reply(Vec::new());
+            }
+            "f_parent" => {
+                let parent = Some(as_str(value)).filter(|f| f != "-");
+                // The picker leaves out the folder and its descendants; a stale event is refused
+                // here too, so a loop cannot be made by racing the view.
+                let allowed = match self.folder.as_deref() {
+                    Some(id) => self.library.can_move_into(id, parent.as_deref()),
+                    None => parent.as_deref().is_none_or(|p| self.library.folder(p).is_some()),
+                };
+                if allowed {
+                    self.folder_parent = parent;
+                } else {
+                    self.message = Some(Message::error("A folder cannot go inside itself or one of its own folders."));
+                }
                 return self.reply(Vec::new());
             }
             "io_json" => {
@@ -631,28 +796,108 @@ impl Panel {
             }
             return self.reply(Vec::new());
         }
+        // Folder rows are numbered by their place in the tree the Folders page draws, not by their
+        // place in the library array: nesting means the two orders differ.
+        let folder_row = |lib: &Library, i: usize| lib.folder_order().get(i).and_then(|id| lib.folder(id)).cloned();
         if let Some(i) = row_index(id, "f", "_edit") {
-            if let Some(f) = self.library.folders.get(i) {
+            if let Some(f) = folder_row(&self.library, i) {
                 // Renaming loads the folder's own name into the field, which is the one place a
-                // folder name is edited.
+                // folder name is edited; its parent is loaded beside it.
                 self.folder = Some(f.id.clone());
                 self.folder_name = f.name.clone();
+                self.folder_parent = f.parent_id.clone();
             }
             return self.reply(Vec::new());
         }
         if let Some(i) = row_index(id, "f", "_del") {
-            if let Some(f) = self.library.folders.get(i) {
+            if let Some(f) = folder_row(&self.library, i) {
                 let id = f.id.clone();
                 self.library.remove_folder(&id);
                 if self.folder.as_deref() == Some(id.as_str()) {
                     self.folder = None;
+                    self.folder_parent = None;
                 }
-                self.message = Some(Message::info("Deleted the folder. Its styles are back in the unsorted list."));
+                self.message = Some(Message::info("Deleted the folder and the folders inside it. Their styles are back in the unsorted list."));
             }
             return self.reply(self.save_library());
         }
+        if let Some(i) = row_index(id, "f", "_up") {
+            if let Some(f) = folder_row(&self.library, i) {
+                self.library.move_folder(&f.id, true);
+            }
+            return self.reply(self.save_library());
+        }
+        if let Some(i) = row_index(id, "f", "_down") {
+            if let Some(f) = folder_row(&self.library, i) {
+                self.library.move_folder(&f.id, false);
+            }
+            return self.reply(self.save_library());
+        }
+        if let Some(i) = row_index(id, "f", "_export") {
+            if let Some(f) = folder_row(&self.library, i) {
+                // TypeR writes `<folder name>.json` through a save dialog. A panel has no file
+                // dialog, so the JSON goes on the Help page to copy out — the same shape TypeR's
+                // "Export folder" button writes.
+                self.io = match serde_json::to_string_pretty(&library::export_folder_json(&self.library, &f.id)) {
+                    Ok(s) => s,
+                    Err(_) => "{}".to_string(),
+                };
+                self.message = Some(Message::info(format!("“{}” is in the box on the Help page: copy it out to keep it, or load it on another machine.", f.name)));
+            }
+            return self.reply(Vec::new());
+        }
+
+        if let Some(i) = row_index(id, "s", "_sizeDown") {
+            return self.quick_size(i, -1.0, at);
+        }
+        if let Some(i) = row_index(id, "s", "_sizeUp") {
+            return self.quick_size(i, 1.0, at);
+        }
+        if let Some(i) = row_index(id, "st", "_load") {
+            self.load_state(i);
+            return self.reply(self.save_script());
+        }
+        if let Some(i) = row_index(id, "st", "_del") {
+            if let Some(name) = self.states.keys().nth(i).cloned() {
+                self.states.remove(&name);
+                self.message = Some(Message::info(format!("Deleted the state “{name}”.")));
+            }
+            return self.reply(self.save_states());
+        }
 
         match id {
+            "back" => {
+                self.page = Page::Lettering;
+                self.reply(Vec::new())
+            }
+            "openSettings" => {
+                self.page = Page::Settings;
+                self.reply(Vec::new())
+            }
+            "openHelp" => {
+                self.page = Page::Help;
+                self.reply(Vec::new())
+            }
+            "openFolders" => {
+                self.page = Page::Folders;
+                self.reply(Vec::new())
+            }
+            "state_save" => {
+                let name = self.state_name.trim().to_string();
+                if name.is_empty() {
+                    self.message = Some(Message::error("A state needs a name: that is what the list on the Settings page shows."));
+                    return self.reply(Vec::new());
+                }
+                let state = SavedState {
+                    script: self.script.clone(),
+                    cursor: self.cursor,
+                    style_id: self.current_line().and_then(|l| l.style_id.clone()).or_else(|| self.library.default_style_id.clone()),
+                };
+                self.states.insert(name.clone(), state);
+                self.state_name.clear();
+                self.message = Some(Message::info(format!("Saved the state “{name}”.")));
+                self.reply(self.save_states())
+            }
             "prev" => {
                 if let Some(at) = script::previous(&self.lines, self.cursor) {
                     self.cursor = at;
@@ -701,7 +946,15 @@ impl Panel {
                 let name = self.folder_name.trim().to_string();
                 let name = if name.is_empty() { format!("Folder {}", self.library.folders.len() + 1) } else { name };
                 let id = self.library.new_folder_id();
-                self.library.folders.push(Folder { id: id.clone(), name: name.clone() });
+                let parent = self.folder_parent.clone().filter(|p| self.library.folder(p).is_some());
+                let order = self.library.child_folders(parent.as_deref()).len();
+                self.library.folders.push(Folder {
+                    id: id.clone(),
+                    name: name.clone(),
+                    parent_id: parent,
+                    order: u32::try_from(order).unwrap_or(0),
+                });
+                self.library.normalize_folders();
                 self.folder = Some(id);
                 self.folder_name = name;
                 self.message = Some(Message::info("Made the folder. Put a style in it with the editor's Folder list."));
@@ -709,21 +962,30 @@ impl Panel {
             }
             "f_save" => {
                 let name = self.folder_name.trim().to_string();
-                if let Some(id) = self.folder.clone()
-                    && let Some(slot) = self.library.folders.iter_mut().find(|x| x.id == id)
-                {
+                if let Some(id) = self.folder.clone() {
                     if name.is_empty() {
                         self.message = Some(Message::error("A folder needs a name."));
                         return self.reply(Vec::new());
                     }
-                    slot.name = name;
+                    let parent = self.folder_parent.clone().filter(|p| self.library.folder(p).is_some());
+                    if !self.library.can_move_into(&id, parent.as_deref()) {
+                        self.message = Some(Message::error("A folder cannot go inside itself or one of its own folders."));
+                        return self.reply(Vec::new());
+                    }
+                    if let Some(slot) = self.library.folders.iter_mut().find(|x| x.id == id) {
+                        slot.name = name;
+                        slot.parent_id = parent;
+                    }
+                    self.library.normalize_folders();
                 }
                 self.folder = None;
-                self.message = Some(Message::info("Renamed the folder. The styles in it are untouched."));
+                self.folder_parent = None;
+                self.message = Some(Message::info("Saved the folder. The styles in it are untouched."));
                 self.reply(self.save_library())
             }
             "f_cancel" => {
                 self.folder = None;
+                self.folder_parent = None;
                 self.reply(Vec::new())
             }
             "set_scaleDefault" => {
@@ -752,11 +1014,16 @@ impl Panel {
                 self.reply(ops)
             }
             "io_export" => {
-                self.io = match serde_json::to_string_pretty(&self.library.to_json()) {
+                // TypeR's export is its storage shape minus the fields a different machine must not
+                // inherit (the `exported` timestamp is the one it writes with a clock; a panel has
+                // none, so it is absent). Every folder and every style directly in one goes out.
+                let ids: Vec<String> = self.library.folders.iter().map(|f| f.id.clone()).collect();
+                let exported = library::export_json(&self.library, &ids, true);
+                self.io = match serde_json::to_string_pretty(&exported) {
                     Ok(s) => s,
                     Err(_) => "{}".to_string(),
                 };
-                self.message = Some(Message::info("This is the library in TyperTools' own export format: copy it out to keep it."));
+                self.message = Some(Message::info("This is the library in TypeR's own export format (`TypeR_Export.json`): copy it out to keep it, or load it on another machine."));
                 self.reply(Vec::new())
             }
             "io_reset" => {
@@ -825,11 +1092,32 @@ impl Panel {
         // The Text Size percentage is TyperTools' own: it scales the size and the leading on the two
         // actions that letter a line, and never when a style is applied to what is already there.
         let scale = if matches!(kind, Kind::Create | Kind::Insert) { self.scale / 100.0 } else { 1.0 };
+        // TypeR's markdown setting: the markers are stripped before the layer is made, and the
+        // weights they asked for go on as character runs afterwards (a panel's `type.create` has no
+        // run list, so it takes one extra `type.edit`). Apply does not touch what a layer says.
+        let (text, runs) = if self.markdown && matches!(kind, Kind::Create | Kind::Insert) {
+            let parsed = script::parse_markdown(&text);
+            let runs = if parsed.has_formatting() { markdown_runs(&parsed.runs) } else { Vec::new() };
+            (parsed.plain, runs)
+        } else {
+            (text, Vec::new())
+        };
         self.runs += 1;
         let mut run = Run::begin(kind, format!("typertools-{}", self.runs), targets);
         run.text = text;
+        run.runs = runs;
+        run.padding = self.padding;
+        run.resize = self.resize_on_center;
         run.style_name = style.name.clone();
         run.params = props::to_params(&style.text_props, self.dpi(), scale);
+        if kind != Kind::Resize
+            && let Some(o) = run.params.as_object_mut()
+        {
+            // TypeR hands its direction to every path that writes text or a style
+            // (`host.js:781`, `:1474`); `type.create`'s and `type.setStyle`'s paragraph keys both
+            // take `auto|ltr|rtl`.
+            o.insert("direction".into(), json!(self.direction));
+        }
         run.antialias = props::anti_alias_param(props::anti_alias(&style.text_props)).to_string();
         // Applying a style applies its size too — TyperTools' own arrow does, and Ctrl+click on it is
         // the exception, which is the second button here.
@@ -842,6 +1130,40 @@ impl Panel {
             None => Step::Failed("the action could not be started".into()),
         };
         self.act(step)
+    }
+
+    /// TypeR's quick style size: a library row's size moved by one `styleSizeStep`, in the style's own
+    /// unit, and stored. It changes the library entry only — no document, no layer.
+    fn quick_size(&mut self, i: usize, direction: f64, at: u64) -> Vec<Value> {
+        let step = positive(self.style_step, 0.1);
+        let decimals = ((format!("{step}").split('.').nth(1).unwrap_or("")).len()).min(12);
+        let Some(style) = self.library.styles.get_mut(i) else {
+            return self.reply(Vec::new());
+        };
+        let base = props::char(&style.text_props, "size").and_then(Value::as_f64).unwrap_or(1.0);
+        let next = normalize_step(base + direction * step, step, decimals);
+        if !(next.is_finite() && next > 0.0) {
+            return self.reply(Vec::new());
+        }
+        props::set_char(&mut style.text_props, "size", json!(next));
+        props::set_char(&mut style.text_props, "impliedFontSize", json!(next));
+        style.edited = at;
+        self.reply(self.save_library())
+    }
+
+    /// Loads a saved state: the script, the line, and the style in use (TypeR's `import` reducer).
+    fn load_state(&mut self, i: usize) {
+        let Some((name, state)) = self.states.iter().nth(i).map(|(n, s)| (n.clone(), s.clone())) else {
+            return;
+        };
+        self.script = state.script;
+        self.reparse();
+        self.cursor = script::settle(&self.lines, state.cursor).unwrap_or(0);
+        if let Some(id) = state.style_id.filter(|id| self.library.style(id).is_some()) {
+            self.library.default_style_id = Some(id);
+        }
+        self.page = Page::Lettering;
+        self.message = Some(Message::info(format!("Loaded the state “{name}”.")));
     }
 
     /// The size buttons: one document pixel's worth of points, keeping the layer where it was.
@@ -861,7 +1183,9 @@ impl Panel {
         }
         self.runs += 1;
         let mut run = Run::begin(Kind::Resize, format!("typertools-{}", self.runs), targets);
-        run.delta = direction * geom::size_step_pt(self.dpi());
+        // TypeR's `textSizeIncrement`, in the layer's own unit — which in PhotoCraft is points.
+        run.delta = direction * self.size_increment;
+        run.padding = self.padding;
         run.params = json!({});
         self.message = Some(Message::info(if direction > 0.0 { "Bigger…" } else { "Smaller…" }));
         self.run = Some(run);
@@ -1035,8 +1359,25 @@ impl Panel {
     }
 
     fn save_settings(&self) -> Vec<Value> {
-        let value = json!({"scale": self.scale, "page": self.page.id()}).to_string();
+        let value = json!({
+            "scale": self.scale,
+            "page": self.page.id(),
+            "markdown": self.markdown,
+            "direction": self.direction,
+            "internalPadding": self.padding,
+            "resizeTextBoxOnCenter": self.resize_on_center,
+            "textSizeIncrement": self.size_increment,
+            "styleSizeStep": self.style_step,
+            "showQuickStyleSize": self.quick_size,
+        })
+        .to_string();
         vec![json!({"op": "storage.set", "key": STORAGE_SETTINGS, "value": value})]
+    }
+
+    fn save_states(&self) -> Vec<Value> {
+        let map: serde_json::Map<String, Value> = self.states.iter().map(|(name, state)| (name.clone(), state.to_json())).collect();
+        let value = Value::Object(map).to_string();
+        vec![json!({"op": "storage.set", "key": STORAGE_STATES, "value": value})]
     }
 
     fn save_script(&self) -> Vec<Value> {
@@ -1072,6 +1413,63 @@ fn now(event: &Value) -> u64 {
 
 fn on(v: &Value) -> bool {
     v.as_bool().unwrap_or(false)
+}
+
+/// Splits a settings field of tags the way TypeR's settings describe them — "separated with line
+/// breaks or semicolons" (`settingsLinePrefixesDescr`, `settingsIgnoreTagsDescr`) — trimming each and
+/// dropping blanks. Nothing is split on spaces: a tag may be `"## "` or `"[note]"`.
+fn split_tags(text: &str) -> Vec<String> {
+    text.split(['\n', ';']).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect()
+}
+
+/// An integer setting, the way TypeR's reducers take one: `parseInt`, then the reducer's clamp, with
+/// rubbish falling back to the default rather than to zero.
+fn integer(value: f64, min: f64, max: f64, fallback: f64) -> f64 {
+    if !value.is_finite() {
+        return fallback;
+    }
+    value.trunc().clamp(min, max)
+}
+
+/// A step that TypeR insists is finite and positive: anything else is its 0.1 default.
+fn positive(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value > 0.0 { value } else { fallback }
+}
+
+/// TypeR's style-size normalisation (`stylesBlock.jsx`): snap to a multiple of the step, at the
+/// step's own number of decimals, and never below 1.
+fn normalize_step(value: f64, step: f64, decimals: usize) -> f64 {
+    let rounded = (value / step).round() * step;
+    let factor = 10f64.powi(i32::try_from(decimals).unwrap_or(3).min(12));
+    (rounded * factor).round() / factor
+}
+
+/// Markdown's weighted runs as `type.edit`'s `runs`: character offsets, and only the weights the
+/// run actually asked for (the style already carries the layer's other character properties).
+fn markdown_runs(runs: &[script::Run]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for run in runs {
+        let start = at;
+        at = at.saturating_add(run.chars);
+        if !(run.bold || run.italic) {
+            continue;
+        }
+        let mut spec = json!({"start": start, "end": at});
+        if run.bold {
+            spec["fauxBold"] = json!(true);
+        }
+        if run.italic {
+            spec["fauxItalic"] = json!(true);
+        }
+        out.push(spec);
+    }
+    out
+}
+
+/// The number a widget sent, or `NaN` so the caller's fallback applies.
+fn num(v: &Value) -> f64 {
+    v.as_f64().filter(|n| n.is_finite()).unwrap_or(f64::NAN)
 }
 
 /// The index in `s3_apply`-shaped ids, for the library rows.
@@ -1279,11 +1677,13 @@ mod tests {
         assert_eq!(h.ops(), ["doc.info", "ui.view"], "a run starts by reading the document");
         h.answer("doc.info", true, doc_fields());
 
-        // The box: the marquee pulled in by 10 px, 0.9 of its width and fifteen times its height —
-        // deliberately far too tall, so the line lays out on one line before it is fitted.
+        // The box: the marquee pulled in by 10 px, 0.9 of its width less TypeR's default internal
+        // padding of 10 px a side, and fifteen times its height — deliberately far too tall, so the
+        // line lays out on one line before it is fitted.
         let call = h.call("type.create").cloned().expect("the layer is made");
         assert_eq!(call["params"]["text"], "I'll be home by six.");
-        assert_eq!(call["params"]["box"], json!([110.0, 60.0, 162.0, 2100.0]));
+        assert_eq!(call["params"]["box"], json!([110.0, 60.0, 142.0, 2100.0]));
+        assert_eq!(call["params"]["direction"], "ltr", "TypeR sends its direction with every create");
         let coalesce = call["params"]["coalesce"].clone();
         assert!(coalesce.is_string(), "{coalesce}");
 
@@ -1386,7 +1786,7 @@ mod tests {
         assert!(h.p.edit.is_some());
         h.answer("doc.command", true, json!({"faces": [{"family": "Inter", "style": "Regular"}]}));
         h.change("ed_name", json!("Balloon talk"));
-        h.change("ed_prefixes", json!("b. B."));
+        h.change("ed_prefixes", json!("b.\nB."));
         h.change("ed_size", json!(17.5));
         h.change("ed_fauxBold", json!(true));
         h.change("ed_underline", json!(true));
@@ -1490,6 +1890,47 @@ mod tests {
         h.change("script", json!("d. hello"));
         assert_eq!(h.p.lines[0].style_id.as_deref(), Some("s1"));
         assert!(h.ops().contains(&"storage.set"), "and the library is stored");
+    }
+
+    #[test]
+    fn the_folder_tree_can_be_nested_and_has_its_own_order() {
+        let mut h = H::fresh();
+        assert_eq!(h.p.library.folder_order(), ["f1", "f2"]);
+        // A new folder goes inside the one the editor's parent dropdown names.
+        h.click("f_new");
+        h.change("f_parent", json!("f1"));
+        h.change("f_name", json!("Narration"));
+        h.click("f_save");
+        let narration = h.p.library.folders.iter().find(|f| f.name == "Narration").cloned().expect("the folder was made");
+        assert_eq!(narration.parent_id.as_deref(), Some("f1"));
+        assert_eq!(h.p.library.folder_order(), ["f1", narration.id.as_str(), "f2"], "a child sits under its parent");
+        // Roots move among roots; a folder's children follow it.
+        h.click("f0_down");
+        assert_eq!(h.p.library.folder_order(), ["f2", "f1", narration.id.as_str()]);
+        // A folder cannot be put inside its own child, and the editor stays open on the refusal.
+        h.click("f1_edit");
+        h.change("f_parent", json!(narration.id));
+        assert!(h.message().contains("cannot go inside itself"), "{}", h.message());
+        h.click("f_save");
+        let dialogue = h.p.library.folder("f1").cloned().expect("Dialogue is still there");
+        assert_eq!(dialogue.parent_id, None);
+        // Deleting a folder takes its subfolders, and the styles in either go back to unsorted.
+        h.click("f1_del");
+        assert!(h.p.library.folders.iter().all(|f| f.id != narration.id));
+        assert_eq!(h.p.library.folders.len(), 1);
+        assert!(h.p.library.styles.iter().all(|s| s.folder.as_deref() != Some("f1")));
+        assert_eq!(h.p.library.styles.len(), 5, "no style is lost");
+    }
+
+    #[test]
+    fn ignore_tags_are_removed_from_the_line_before_it_is_lettered() {
+        let mut h = H::fresh();
+        h.change("set_ignoreTags", json!("[note]\n{sfx}"));
+        assert_eq!(h.p.library.ignore_tags, ["[note]", "{sfx}"]);
+        h.change("script", json!("d. hello [note] there"));
+        assert_eq!(h.p.lines[0].text, "hello  there", "the tag goes, the words around it stay");
+        assert!(h.p.lines[0].style_id.is_some());
+        assert!(h.ops().contains(&"storage.set"), "the tags are part of the library");
     }
 
     #[test]
@@ -1621,14 +2062,20 @@ mod tests {
     }
 
     #[test]
-    fn the_size_buttons_step_by_a_document_pixel() {
+    fn the_size_buttons_step_by_the_size_increment_setting() {
         let mut h = H::fresh();
         h.doc();
         h.click("sizeUp");
         assert_eq!(h.first_call(), "type.info", "a resize starts by measuring the layer");
         assert_eq!(h.p.run.as_ref().map(|r| r.kind), Some(Kind::Resize));
         let delta = h.p.run.as_ref().map(|r| r.delta).unwrap_or(0.0);
-        assert!((delta - 72.0 / 300.0).abs() < 1e-9, "one document pixel in points: {delta}");
+        assert!((delta - 1.0).abs() < 1e-9, "TypeR's default increment is one unit: {delta}");
+        // The setting is TypeR's `textSizeIncrement`, an integer 1–99.
+        let mut h = H::fresh();
+        h.doc();
+        h.change("set_sizeIncrement", json!(3));
+        h.click("sizeDown");
+        assert_eq!(h.p.run.as_ref().map(|r| r.delta), Some(-3.0));
         // With no type layer to work on, nothing starts.
         let mut h = H::fresh();
         h.answer("doc.info", true, json!({"width": 10, "height": 10, "resolution": 72, "layers": []}));
@@ -1648,6 +2095,175 @@ mod tests {
         assert_eq!(run.kind, Kind::Apply);
         assert_eq!(run.style_name, "Sound effect", "the fifth style of the starter library");
         assert_eq!(run.text, "", "applying a style does not touch the text");
+    }
+
+    #[test]
+    fn markdown_bold_and_italic_become_character_runs() {
+        let mut h = H::fresh();
+        h.doc();
+        h.change("set_markdown", json!(true));
+        h.change("script", json!("d. I **am** *here*"));
+        h.click("create");
+        h.answer("doc.info", true, doc_fields());
+        let call = h.call("type.create").cloned().expect("the layer is made");
+        assert_eq!(call["params"]["text"], "I am here", "the markers are gone from what the layer says");
+        h.answer("doc.command", true, json!({"layer": 9}));
+        let edit = h.call("type.edit").cloned().expect("the weights go on as runs");
+        assert_eq!(edit["params"]["layer"], 9);
+        assert_eq!(
+            edit["params"]["runs"],
+            json!([
+                {"start": 2, "end": 4, "fauxBold": true},
+                {"start": 5, "end": 9, "fauxItalic": true},
+            ])
+        );
+        // The measurement still follows, and the run then finishes normally.
+        h.answer("doc.command", true, type_fields());
+        assert_eq!(h.first_call(), "type.info");
+        h.drive();
+        assert!(h.p.message.as_ref().is_some_and(|m| m.text.contains("I am here")), "{:?}", h.p.message);
+    }
+
+    #[test]
+    fn the_markdown_markers_stay_when_the_setting_is_off() {
+        let mut h = H::fresh();
+        h.doc();
+        h.change("script", json!("d. **loud**"));
+        h.click("create");
+        h.answer("doc.info", true, doc_fields());
+        let call = h.call("type.create").cloned().expect("the layer is made");
+        assert_eq!(call["params"]["text"], "**loud**", "TypeR's markdown is off by default");
+        h.answer("doc.command", true, json!({"layer": 9}));
+        assert_eq!(h.first_call(), "type.info", "and no run edit is inserted");
+    }
+
+    #[test]
+    fn internal_padding_and_direction_reach_the_box_and_the_style() {
+        let mut h = H::fresh();
+        h.doc();
+        h.change("set_padding", json!(20.0));
+        h.change("set_direction", json!("rtl"));
+        h.change("script", json!("d. hello"));
+        h.click("create");
+        h.answer("doc.info", true, doc_fields());
+        let call = h.call("type.create").cloned().expect("the layer is made");
+        // The 180 px-wide marquee: 0.9 of it is 162, less 20 px of padding a side.
+        assert_eq!(call["params"]["box"], json!([110.0, 60.0, 122.0, 2100.0]));
+        assert_eq!(call["params"]["direction"], "rtl");
+        // A setting outside TypeR's range is brought inside it, never sent as it came.
+        let mut h = H::fresh();
+        h.change("set_padding", json!(500.0));
+        assert_eq!(h.p.padding, 100.0);
+        h.change("set_padding", json!(-20.0));
+        assert_eq!(h.p.padding, 0.0);
+        h.change("set_sizeIncrement", json!(0));
+        assert_eq!(h.p.size_increment, 1.0);
+        h.change("set_styleStep", json!(0));
+        assert_eq!(h.p.style_step, 0.1);
+    }
+
+    #[test]
+    fn align_only_reshapes_the_box_when_resize_on_centre_is_on() {
+        let mut h = H::fresh();
+        h.doc();
+        h.click("align");
+        h.answer("doc.info", true, doc_fields());
+        h.answer("doc.command", true, type_fields());
+        let edit = h.call("type.edit").cloned().expect("the layer is centred");
+        assert!(edit["params"].get("box").is_none(), "the box is left alone: {edit}");
+        assert!(edit["params"].get("move").is_some());
+        // On: the balloon's box, less the default 10 px of padding a side.
+        let mut h = H::fresh();
+        h.doc();
+        h.change("set_resizeOnCenter", json!(true));
+        h.click("align");
+        h.answer("doc.info", true, doc_fields());
+        h.answer("doc.command", true, type_fields());
+        let edit = h.call("type.edit").cloned().expect("the layer is reshaped");
+        assert_eq!(edit["params"]["box"], json!([110.0, 60.0, 142.0, 2100.0]));
+    }
+
+    #[test]
+    fn the_quick_style_size_edit_is_stored_in_the_styles_own_unit() {
+        let mut h = H::fresh();
+        let size = |h: &H| props::char(&h.p.library.styles[0].text_props, "size").and_then(Value::as_f64).unwrap_or(0.0);
+        let before = size(&h);
+        h.click("s0_sizeUp");
+        assert!((size(&h) - (before + 0.1)).abs() < 1e-9, "the 0.1 default step: {}", size(&h));
+        assert!(h.ops().contains(&"storage.set"), "the library is stored");
+        h.change("set_styleStep", json!(0.5));
+        h.click("s0_sizeDown");
+        // The nudge snaps to a multiple of the new step (TypeR's `normalizeSizeStep`), so 14.1
+        // less 0.5 is 13.5, not 13.6.
+        assert!((size(&h) - 13.5).abs() < 1e-9, "{}", size(&h));
+        h.change("s0_size", json!(20.0));
+        assert!((size(&h) - 20.0).abs() < 1e-9);
+        // Rubbish in the field changes nothing.
+        h.change("s0_size", json!("nonsense"));
+        assert!((size(&h) - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_state_saves_the_script_the_line_and_the_style_and_loads_them_back() {
+        let mut h = H::fresh();
+        h.change("script", json!("d. one\nd. two"));
+        h.click("next");
+        assert_eq!(h.p.cursor, 1);
+        h.change("state_name", json!("Scene 3"));
+        h.click("state_save");
+        assert!(h.p.states.contains_key("Scene 3"));
+        assert!(h.ops().contains(&"storage.set"), "the states are stored");
+        h.change("script", json!("d. something else"));
+        h.click("st0_load");
+        assert_eq!(h.p.script, "d. one\nd. two");
+        assert_eq!(h.p.cursor, 1, "the line it was on");
+        assert_eq!(h.p.page, Page::Lettering, "loading a state goes back to the panes");
+        h.click("st0_del");
+        assert!(h.p.states.is_empty());
+        // A state with no name is refused rather than saved as an unnamed key.
+        h.click("state_save");
+        assert!(h.message().contains("needs a name"), "{}", h.message());
+    }
+
+    #[test]
+    fn the_type_r_settings_survive_a_restart() {
+        let mut h = H { p: Panel::new(), out: Vec::new() };
+        h.send(json!({"type": "init", "now": 10, "storage": {
+            "settings": json!({
+                "scale": 120, "page": "settings", "markdown": true, "direction": "rtl",
+                "internalPadding": 25, "resizeTextBoxOnCenter": true,
+                "textSizeIncrement": 5, "styleSizeStep": 0.5, "showQuickStyleSize": false,
+            }).to_string(),
+        }}));
+        assert_eq!(h.p.scale, 120.0);
+        assert_eq!(h.p.page, Page::Settings);
+        assert!(h.p.markdown);
+        assert_eq!(h.p.direction, "rtl");
+        assert_eq!(h.p.padding, 25.0);
+        assert!(h.p.resize_on_center);
+        assert_eq!(h.p.size_increment, 5.0);
+        assert_eq!(h.p.style_step, 0.5);
+        assert!(!h.p.quick_size);
+    }
+
+    #[test]
+    fn a_folder_exports_the_single_folder_shape_type_r_writes() {
+        let mut h = H::fresh();
+        let folder = h.p.library.folders[0].clone();
+        let has_styles = !h.p.library.styles_in(Some(&folder.id)).is_empty();
+        // Give the folder a style so the export has something in it.
+        if !has_styles
+            && let Some(s) = h.p.library.styles.first_mut()
+        {
+            s.folder = Some(folder.id.clone());
+        }
+        h.click("f0_export");
+        let exported: Value = serde_json::from_str(&h.p.io).expect("the box holds JSON");
+        assert_eq!(exported["name"], json!(folder.name));
+        assert!(exported["exportedStyles"].is_array());
+        assert!(exported.get("styles").is_none(), "the single-folder shape has exportedStyles: {}", h.p.io);
+        assert!(exported.get("version").is_none());
+        assert!(h.message().contains("Help page"), "{}", h.message());
     }
 
     #[test]
@@ -1675,7 +2291,7 @@ mod tests {
     #[test]
     fn the_settings_are_remembered_and_the_ignore_prefix_is_the_librarys_own() {
         let mut h = H::fresh();
-        let out = h.change("set_ignore", json!("# --"));
+        let out = h.change("set_ignore", json!("#\n--"));
         assert!(out.ops().contains(&"storage.set"));
         assert_eq!(h.p.library.ignore_prefixes, vec!["#", "--"]);
         h.change("script", json!("# note\nd. hi"));
